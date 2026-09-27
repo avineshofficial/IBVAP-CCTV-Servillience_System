@@ -1,0 +1,40 @@
+# ============================================
+# IBVAP — Intelligent Border Video Analytics Platform
+# Python Dependencies
+# ============================================
+
+# --- Core (Required for prototype) ---
+opencv-python-headless>=4.9   # Video capture, image processing, homography
+numpy>=1.26
+
+# --- Backend (Core Platform) ---
+fastapi>=0.110.0              # Async REST API framework
+uvicorn[standard]>=0.27.0     # ASGI server
+sqlalchemy>=2.0.25            # ORM for database models
+aiosqlite>=0.19.0             # Async SQLite driver (prototype)
+greenlet>=3.0.0               # Required by SQLAlchemy async
+pydantic>=2.6.0               # Data validation schemas
+python-jose[cryptography]>=3.3.0  # JWT tokens
+python-multipart>=0.0.6       # File uploads
+websockets>=12.0              # WebSocket support
+
+# --- Utilities ---
+pillow>=10.2.0                # Image processing
+httpx>=0.27.0                 # Async HTTP client (edge→core sync)
+python-dotenv>=1.0.0          # Environment variable loading
+rich>=13.7.0                  # Beautiful terminal output
+
+# --- AI / ML Models (required for real detection -- without these the
+# edge pipeline silently runs in SIMULATION mode with 4 fake synthetic
+# objects instead of your actual camera feed) ---
+ultralytics>=8.4.0             # YOLO26/YOLO11 detection + ByteTrack tracking
+insightface>=0.7.3             # SCRFD face detection + ArcFace recognition
+onnxruntime>=1.17.0             # ONNX inference runtime (required by insightface)
+paddlepaddle>=3.0.0             # Required by paddleocr
+paddleocr>=2.7.0                # ANPR text recognition
+torch>=2.2.0                    # Pulled in by ultralytics; pin explicitly so you
+                                 # notice if a CPU-only build gets installed instead
+                                 # of one matching your GPU's CUDA version
+torchvision>=0.17.0              # Image transforms
+scikit-learn>=1.4.0              # Cosine similarity for face/watchlist matching
+
