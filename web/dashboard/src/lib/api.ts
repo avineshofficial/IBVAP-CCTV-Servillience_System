@@ -16,17 +16,92 @@ const API_BASE =
 const WS_BASE = API_BASE.replace(/^http/, "ws");
 
 // ─────────────────────────────────────────────
-// Shared fetch helper
+// Shared fetch helper & Auth Management
 // ─────────────────────────────────────────────
+
+let cachedToken: string | null = null;
+
+export function getStoredToken(): string | null {
+  if (cachedToken) return cachedToken;
+  if (typeof window !== "undefined") {
+    cachedToken = localStorage.getItem("ibvap_token");
+    return cachedToken;
+  }
+  return null;
+}
+
+export function setStoredToken(token: string | null): void {
+  cachedToken = token;
+  if (typeof window !== "undefined") {
+    if (token) localStorage.setItem("ibvap_token", token);
+    else localStorage.removeItem("ibvap_token");
+  }
+}
+
+async function ensureToken(): Promise<string | null> {
+  const token = getStoredToken();
+  if (token) return token;
+
+  // Auto-authenticate with prototype demo admin credentials if no token is saved
+  try {
+    const res = await fetch(`${API_BASE}/api/v1/auth/login`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ username: "admin", password: "admin123" }),
+    });
+    if (res.ok) {
+      const data = await res.json();
+      if (data.access_token) {
+        setStoredToken(data.access_token);
+        return data.access_token;
+      }
+    }
+  } catch (err) {
+    console.warn("Auto-login failed:", err);
+  }
+  return null;
+}
 
 async function apiFetch<T>(
   path: string,
   options: RequestInit = {}
 ): Promise<T> {
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+    ...((options.headers as Record<string, string>) || {}),
+  };
+
+  if (!headers["Authorization"] && !path.includes("/auth/login")) {
+    const token = await ensureToken();
+    if (token) {
+      headers["Authorization"] = `Bearer ${token}`;
+    }
+  }
+
   const res = await fetch(`${API_BASE}${path}`, {
-    headers: { "Content-Type": "application/json", ...(options.headers || {}) },
     ...options,
+    headers,
   });
+
+  if (res.status === 401 && !path.includes("/auth/login")) {
+    // Token may have expired — clear and attempt auto-refresh
+    setStoredToken(null);
+    const freshToken = await ensureToken();
+    if (freshToken) {
+      headers["Authorization"] = `Bearer ${freshToken}`;
+      const retryRes = await fetch(`${API_BASE}${path}`, {
+        ...options,
+        headers,
+      });
+      if (!retryRes.ok) {
+        const body = await retryRes.text().catch(() => "");
+        throw new Error(`${options.method || "GET"} ${path} → HTTP ${retryRes.status}: ${body}`);
+      }
+      if (retryRes.status === 204) return undefined as T;
+      return retryRes.json() as Promise<T>;
+    }
+  }
+
   if (!res.ok) {
     const body = await res.text().catch(() => "");
     throw new Error(`${options.method || "GET"} ${path} → HTTP ${res.status}: ${body}`);
@@ -110,6 +185,7 @@ export interface ChainVerification {
   verified: boolean;
   chain_length: number;
   verified_count?: number;
+  broken_at_record_id?: number | null;
   message: string;
   last_hash?: string;
 }
@@ -301,8 +377,16 @@ export const rotateSecurityKeys = () =>
     method: "POST",
   });
 
+export interface SecurityAuditScanResult {
+  status: string;
+  score: number;
+  chain_verification: ChainVerification;
+  checked_policies: string[];
+  timestamp: string;
+}
+
 export const runSecurityAuditScan = () =>
-  apiFetch<{ status: string; message: string }>("/api/v1/security/run-audit", {
+  apiFetch<SecurityAuditScanResult>("/api/v1/security/run-audit", {
     method: "POST",
   });
 
@@ -331,3 +415,56 @@ export function connectAlertWebSocket(
     return null;
   }
 }
+
+// ─────────────────────────────────────────────
+// Auth Endpoints & Demo Switcher
+// ─────────────────────────────────────────────
+
+export interface User {
+  id: number;
+  username: string;
+  name?: string | null;
+  role: string;
+  bop_id?: string | null;
+  email?: string | null;
+}
+
+export interface TokenResponse {
+  access_token: string;
+  token_type: string;
+  user: User;
+}
+
+export async function login(username: string, password: string): Promise<TokenResponse> {
+  const data = await apiFetch<TokenResponse>("/api/v1/auth/login", {
+    method: "POST",
+    body: JSON.stringify({ username, password }),
+  });
+  if (data?.access_token) {
+    setStoredToken(data.access_token);
+  }
+  return data;
+}
+
+export function logout(): void {
+  setStoredToken(null);
+}
+
+export async function switchDemoRole(
+  role: "admin" | "hq_analyst" | "post_commander" | "field_officer"
+): Promise<TokenResponse> {
+  const pwMap: Record<string, string> = {
+    admin: "admin123",
+    hq_analyst: "analyst123",
+    post_commander: "commander123",
+    field_officer: "officer123",
+  };
+  const userMap: Record<string, string> = {
+    admin: "admin",
+    hq_analyst: "analyst",
+    post_commander: "commander",
+    field_officer: "officer",
+  };
+  return login(userMap[role], pwMap[role]);
+}
+
