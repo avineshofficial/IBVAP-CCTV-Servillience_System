@@ -205,7 +205,10 @@ def main():
         logger.info("Interrupted by user")
     finally:
         camera.release()
-        cv2.destroyAllWindows()
+        try:
+            cv2.destroyAllWindows()
+        except Exception:
+            pass
         if writer is not None:
             writer.release()
 
