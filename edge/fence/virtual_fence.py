@@ -89,7 +89,10 @@ class VirtualFenceEngine:
         self._crossing_state: dict[tuple[int, str], bool] = {}
         # Breach cooldown: {(track_id, zone_id): last_breach_time}
         self._breach_cooldown: dict[tuple[int, str], float] = {}
-        self._cooldown_seconds = 10.0
+        # Zone-level incident cooldown (prevents nonstop alerts queue spam)
+        self._zone_breach_cooldown: dict[str, float] = {}
+        self._cooldown_seconds = 5.0
+        self._zone_cooldown_seconds = 5.0
 
     def calibrate(
         self,
@@ -182,6 +185,84 @@ class VirtualFenceEngine:
 
         return inside
 
+    def _check_straight_line_crossing(
+        self,
+        track_id: int,
+        zone_id: str,
+        current_point: tuple[float, float],
+        line_pts: list[tuple[float, float]],
+        prev_point: tuple[float, float] = None,
+        bbox: tuple = None,
+    ) -> Optional[str]:
+        """
+        Check if a tracked object crossed a straight line boundary (in or out).
+        line_pts: [ (x1, y1), (x2, y2) ]
+        Returns:
+            "crossed_in": crossed into restricted side
+            "crossed_out": crossed into secure side
+            None: no crossing
+        """
+        if len(line_pts) < 2:
+            return None
+
+        p1, p2 = line_pts[0], line_pts[1]
+        x1, y1 = p1
+        x2, y2 = p2
+
+        key = (track_id, zone_id)
+
+        # 2D cross-product to determine which side of directed line (p1 -> p2) point is on:
+        def side_of_line(pt):
+            return (x2 - x1) * (pt[1] - y1) - (y2 - y1) * (pt[0] - x1)
+
+        curr_side = side_of_line(current_point)
+        was_side = self._crossing_state.get(key)
+
+        # Check bbox bottom and center
+        side_bottom = curr_side
+        side_center = curr_side
+        touches_line = False
+        if bbox is not None and len(bbox) == 4:
+            bx1, by1, bx2, by2 = bbox
+            side_bottom = side_of_line(((bx1 + bx2) / 2.0, by2))
+            side_center = side_of_line(((bx1 + bx2) / 2.0, (by1 + by2) / 2.0))
+            
+            # Touch detection: check if human body / bounding box touches or intersects the line
+            line_y = (y1 + y2) / 2.0
+            min_lx, max_lx = min(x1, x2), max(x1, x2)
+            if (by1 - 6 <= line_y <= by2 + 6) and (bx2 >= min_lx and bx1 <= max_lx):
+                touches_line = True
+
+        touch_key = (track_id, f"{zone_id}_touch")
+        was_touching = self._crossing_state.get(touch_key, False)
+
+        if was_side is None and prev_point is not None:
+            was_side = side_of_line(prev_point)
+
+        result = None
+        # 1. Trigger if human touches the border line
+        if touches_line and not was_touching:
+            result = "touched_border_line"
+
+        self._crossing_state[touch_key] = touches_line
+
+        # 2. Trigger if crossing between zones (IN / OUT) or first seen on restricted side
+        if result is None:
+            if was_side is not None:
+                # Crossed IN (into restricted area below line)
+                if was_side < 0 and (curr_side >= 0 or side_bottom >= 0 or side_center >= 0):
+                    result = "crossed_in"
+                # Crossed OUT (back to secure area above line)
+                elif was_side > 0 and (curr_side <= 0 or side_bottom <= 0 or side_center <= 0):
+                    result = "crossed_out"
+            elif curr_side >= 0 or side_bottom >= 0 or touches_line:
+                # First seen already on restricted side below line
+                result = "crossed_in"
+
+        # Update stored side
+        self._crossing_state[key] = 1 if (curr_side >= 0 or side_bottom >= 0) else -1
+        return result
+
     def _check_line_crossing(
         self,
         track_id: int,
@@ -237,6 +318,7 @@ class VirtualFenceEngine:
         camera_id: str,
         timestamp: float = None,
         track_history: list[tuple[float, float]] = None,
+        bbox: tuple = None,
     ) -> list[FenceBreach]:
         """
         Evaluate all zones against a track's current position.
@@ -254,13 +336,35 @@ class VirtualFenceEngine:
 
             key = (track_id, zone.zone_id)
 
-            # Check cooldown
+            # Check track-specific cooldown: ensures the same person doesn't re-trigger duplicate alerts every frame,
+            # while allowing EVERY OTHER PERSON to be evaluated and alerted independently.
             last_breach = self._breach_cooldown.get(key, 0)
             if timestamp - last_breach < self._cooldown_seconds:
                 continue
 
             polygon = zone.polygon_points_pixel
             is_inside = self._point_in_polygon(ground_point, polygon)
+            
+            # Robust overlap check: if ground point is outside, check if center or bounding box overlaps the restricted zone
+            if not is_inside and bbox is not None and len(bbox) == 4:
+                bx1, by1, bx2, by2 = bbox
+                c_pt = ((bx1 + bx2) / 2.0, (by1 + by2) / 2.0)
+                if self._point_in_polygon(c_pt, polygon):
+                    is_inside = True
+                else:
+                    test_pts = [
+                        (bx2, (by1 + by2) / 2.0),
+                        (bx1, (by1 + by2) / 2.0),
+                        ((bx1 + bx2) / 2.0, by1),
+                        (bx2, by2),
+                        (bx1, by2),
+                        ((bx1 + bx2) / 2.0, by2),
+                    ]
+                    for tp in test_pts:
+                        if self._point_in_polygon(tp, polygon):
+                            is_inside = True
+                            break
+
             geo_point = self.pixel_to_geo(ground_point)
 
             breach = None
@@ -284,17 +388,27 @@ class VirtualFenceEngine:
                     )
 
             elif zone.rule_type == FenceRuleType.LINE_CROSS:
-                # Line crossing: breach on entry or exit
-                crossing = self._check_line_crossing(
-                    track_id, zone.zone_id, ground_point, polygon
-                )
+                if len(polygon) == 2:
+                    prev_pt = track_history[-2] if (track_history and len(track_history) >= 2) else None
+                    crossing = self._check_straight_line_crossing(
+                        track_id=track_id,
+                        zone_id=zone.zone_id,
+                        current_point=ground_point,
+                        line_pts=polygon,
+                        prev_point=prev_pt,
+                        bbox=bbox,
+                    )
+                else:
+                    crossing = self._check_line_crossing(
+                        track_id, zone.zone_id, ground_point, polygon
+                    )
                 if crossing:
                     breach = FenceBreach(
                         zone_id=zone.zone_id,
                         zone_name=zone.name,
                         track_id=track_id,
                         object_class=object_class,
-                        breach_type=f"crossed_{crossing}",
+                        breach_type=crossing,
                         severity=zone.severity.value,
                         ground_point_pixel=ground_point,
                         ground_point_geo=geo_point,
@@ -358,59 +472,82 @@ class VirtualFenceEngine:
             if breach:
                 breaches.append(breach)
                 self._breach_cooldown[key] = timestamp
+                self._zone_breach_cooldown[zone.zone_id] = timestamp
 
         return breaches
 
-    def create_demo_zones(self, frame_width: int, frame_height: int, camera_id: str = "cam_01"):
-        """Create demo fence zones for testing (covers typical CCTV layout)."""
-        # Zone 1: Border line (horizontal line near the middle)
-        border_zone = FenceZone(
+    def create_straight_border_line(
+        self,
+        frame_width: int = 1280,
+        frame_height: int = 720,
+        camera_id: str = "cam_01",
+        line_y_ratio: float = 0.52,
+    ):
+        """Create a single high-visibility straight red border line across the screen."""
+        self._zones.clear()
+
+        y_pos = float(int(frame_height * line_y_ratio))
+        p1 = (0.0, y_pos)
+        p2 = (float(frame_width), y_pos)
+
+        border_line_zone = FenceZone(
             zone_id="zone_border_line",
             name="Border Line Alpha",
             camera_id=camera_id,
-            polygon_points_pixel=[
-                (0, frame_height * 0.5),
-                (frame_width, frame_height * 0.5),
-                (frame_width, frame_height * 0.55),
-                (0, frame_height * 0.55),
-            ],
+            polygon_points_pixel=[p1, p2],
             rule_type=FenceRuleType.LINE_CROSS,
             severity=BreachSeverity.CRITICAL,
         )
+        self.add_zone(border_line_zone)
+        logger.info(f"Initialized straight border line at Y={y_pos:.0f} (0, {y_pos:.0f}) -> ({frame_width}, {y_pos:.0f}) for {camera_id}")
 
-        # Zone 2: Restricted area (right side)
+    def create_restricted_border_zone(self, frame_width: int, frame_height: int, camera_id: str = "cam_01"):
+        """Alias for creating the straight border line."""
+        self.create_straight_border_line(frame_width, frame_height, camera_id)
+
+    def create_demo_zones(self, frame_width: int, frame_height: int, camera_id: str = "cam_01"):
+        """Backward-compatible alias for creating both border line + restricted area."""
+        self.create_straight_border_line(frame_width, frame_height, camera_id)
+        self.create_restricted_area_zone(frame_width, frame_height, camera_id)
+
+    def create_restricted_area_zone(
+        self,
+        frame_width: int = 1280,
+        frame_height: int = 720,
+        camera_id: str = "cam_01",
+        line_y_ratio: float = 0.52,
+    ):
+        """
+        Create a full restricted AREA polygon covering everything below the border line.
+        When a person enters this area, an EXCLUSION breach alert is triggered.
+        This covers the entire lower portion of the camera view.
+        """
+        y_pos = float(int(frame_height * line_y_ratio))
+
+        # Full polygon: 4 corners covering the entire area below the border line
+        restricted_polygon = [
+            (0.0, y_pos),                        # top-left (on the border line)
+            (float(frame_width), y_pos),          # top-right (on the border line)
+            (float(frame_width), float(frame_height)),  # bottom-right
+            (0.0, float(frame_height)),           # bottom-left
+        ]
+
+        zone_id = "zone_restricted_area"
+
+        # Don't add duplicate
+        if zone_id in self._zones:
+            return
+
         restricted_zone = FenceZone(
-            zone_id="zone_restricted",
-            name="Restricted Area Bravo",
+            zone_id=zone_id,
+            name="Restricted Alert Area",
             camera_id=camera_id,
-            polygon_points_pixel=[
-                (frame_width * 0.7, frame_height * 0.2),
-                (frame_width * 0.95, frame_height * 0.2),
-                (frame_width * 0.95, frame_height * 0.8),
-                (frame_width * 0.7, frame_height * 0.8),
-            ],
+            polygon_points_pixel=restricted_polygon,
             rule_type=FenceRuleType.EXCLUSION,
-            severity=BreachSeverity.HIGH,
+            severity=BreachSeverity.CRITICAL,
         )
-
-        # Zone 3: Dwell monitoring area (left side)
-        dwell_zone = FenceZone(
-            zone_id="zone_dwell",
-            name="Dwell Monitor Charlie",
-            camera_id=camera_id,
-            polygon_points_pixel=[
-                (frame_width * 0.05, frame_height * 0.3),
-                (frame_width * 0.3, frame_height * 0.3),
-                (frame_width * 0.3, frame_height * 0.7),
-                (frame_width * 0.05, frame_height * 0.7),
-            ],
-            rule_type=FenceRuleType.DWELL,
-            severity=BreachSeverity.MEDIUM,
-            dwell_threshold=15.0,
-        )
-
-        self.add_zone(border_zone)
         self.add_zone(restricted_zone)
-        self.add_zone(dwell_zone)
-
-        logger.info(f"Created {len(self._zones)} demo fence zones")
+        logger.info(
+            f"Initialized restricted area zone below Y={y_pos:.0f} "
+            f"(full cover: 4-corner polygon {frame_width}x{frame_height - int(y_pos)}px) for {camera_id}"
+        )

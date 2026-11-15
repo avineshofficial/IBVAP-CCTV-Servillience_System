@@ -49,19 +49,8 @@ async def edge_sync(
             )
             db.add(db_event)
             events_received += 1
-            await db.flush()
 
-            # Check if camera exists in Camera table
-            cam = (await db.execute(select(Camera).where(Camera.camera_uid == edge_event.camera_id))).scalar_one_or_none()
-            if not cam:
-                sec_log = SecurityAuditLog(
-                    event_type="UNRESOLVED_CAMERA_EVENT",
-                    severity="warning",
-                    actor=payload.edge_id or "edge_sync",
-                    ip_address="127.0.0.1",
-                    details=f"DetectionEvent ID {db_event.id} (edge_event_id: {edge_event.edge_event_id}, type: '{edge_event.event_type}') received with unresolvable camera_id '{edge_event.camera_id}'."
-                )
-                db.add(sec_log)
+        await db.flush()
 
         # Process alerts
         for edge_alert in payload.alerts:
@@ -86,6 +75,14 @@ async def edge_sync(
                         alert_bop = cam.bop_id
                 if not alert_bop:
                     alert_bop = "unassigned"
+                    sec_log = SecurityAuditLog(
+                        event_type="UNRESOLVED_CAMERA_ALERT",
+                        severity="warning",
+                        actor=payload.edge_id or "edge_sync",
+                        ip_address="127.0.0.1",
+                        details=f"Alert {edge_alert.edge_alert_id} ({edge_alert.alert_type}) received with unresolvable camera_id '{camera_uid or 'unknown'}'. Quarantined to bop_id='unassigned'."
+                    )
+                    db.add(sec_log)
 
                 db_alert = Alert(
                     severity=severity,
@@ -97,17 +94,6 @@ async def edge_sync(
                 )
                 db.add(db_alert)
                 alerts_received += 1
-                await db.flush()
-
-                if alert_bop == "unassigned":
-                    sec_log = SecurityAuditLog(
-                        event_type="UNRESOLVED_CAMERA_ALERT",
-                        severity="warning",
-                        actor=payload.edge_id or "edge_sync",
-                        ip_address="127.0.0.1",
-                        details=f"Alert ID {db_alert.id} (edge_alert_id: {edge_alert.edge_alert_id}, type: '{edge_alert.alert_type}') received with unresolvable camera_id '{camera_uid or 'unknown'}'. Quarantined to bop_id='unassigned'."
-                    )
-                    db.add(sec_log)
 
                 # Import here to avoid circular reference
                 from core.audit_chain.ledger import audit_ledger

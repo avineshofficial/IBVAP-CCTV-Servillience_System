@@ -43,20 +43,34 @@ async def seed_demo_data():
         # Check if already seeded
         result = await db.execute(select(Camera).limit(1))
         if result.scalar_one_or_none():
+            from core.models import Zone
+            zone_result = await db.execute(select(Zone).where(Zone.zone_uid == "zone_border_line"))
+            if not zone_result.scalar_one_or_none():
+                zone = Zone(
+                    zone_uid="zone_border_line",
+                    name="Border Line Alpha",
+                    camera_uid="cam_01",
+                    polygon_points_pixel=[[0.0, 396.0], [1280.0, 396.0]],
+                    rule_type="line_cross",
+                    is_active=True,
+                )
+                db.add(zone)
+                await db.commit()
+                logger.info("Seeded Border Line Alpha into zones")
             return
 
         logger.info("Seeding demo data...")
 
-        # Demo cameras
+        # Primary optical camera (cam_01) - connects to standard Webcam / CCTV feed
         cameras = [
-            Camera(name="BOP Alpha - Gate", camera_uid="cam_01", bop_id="bop_alpha",
-                   lat=26.8467, lng=80.9462, status="online"),
-            Camera(name="BOP Alpha - Perimeter N", camera_uid="cam_02", bop_id="bop_alpha",
-                   lat=26.8470, lng=80.9465, status="online"),
-            Camera(name="BOP Alpha - Perimeter S", camera_uid="cam_03", bop_id="bop_alpha",
-                   lat=26.8464, lng=80.9460, status="online"),
-            Camera(name="BOP Bravo - Main", camera_uid="cam_04", bop_id="bop_bravo",
-                   lat=26.9100, lng=81.0200, status="offline"),
+            Camera(
+                name="Primary Optical Sensor (Lenovo 300 FHD Live)",
+                camera_uid="cam_01",
+                bop_id="bop_alpha",
+                lat=26.8467,
+                lng=80.9462,
+                status="offline",
+            ),
         ]
         for cam in cameras:
             db.add(cam)
@@ -271,7 +285,7 @@ def main():
         "core.main:app",
         host=CoreConfig.HOST,
         port=CoreConfig.PORT,
-        reload=True,
+        reload=False,
         log_level="info",
     )
 

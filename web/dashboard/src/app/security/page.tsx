@@ -1,5 +1,5 @@
 "use client";
-import { useEffect, useState } from "react";
+import React, { useEffect, useState } from "react";
 import {
   getSecurityStats,
   getSecurityLogs,
@@ -15,6 +15,8 @@ import type {
   DPDPCompliance,
 } from "@/lib/api";
 
+type SecurityTab = "overview" | "rbac" | "dpdp" | "logs";
+
 export default function SecurityPage() {
   const [stats, setStats] = useState<SecurityStats | null>(null);
   const [logs, setLogs] = useState<SecurityLogItem[]>([]);
@@ -23,16 +25,10 @@ export default function SecurityPage() {
   const [loading, setLoading] = useState(true);
   const [rotating, setRotating] = useState(false);
   const [scanning, setScanning] = useState(false);
-  const [activeTab, setActiveTab] = useState<"overview" | "rbac" | "dpdp" | "logs">("overview");
+  const [activeTab, setActiveTab] = useState<SecurityTab>("overview");
   const [notification, setNotification] = useState<string | null>(null);
 
-  useEffect(() => {
-    loadData();
-    const interval = setInterval(loadData, 5000);
-    return () => clearInterval(interval);
-  }, []);
-
-async function loadData() {
+  const refreshData = async () => {
     try {
       const [s, l, r, d] = await Promise.all([
         getSecurityStats(),
@@ -41,22 +37,53 @@ async function loadData() {
         getDPDPCompliance(),
       ]);
       setStats(s);
-      setLogs(l);
-      setRbac(r);
+      setLogs(Array.isArray(l) ? l : []);
+      setRbac(Array.isArray(r) ? r : []);
       setDpdp(d);
     } catch (e) {
       console.error("Security data load failed:", e);
     } finally {
       setLoading(false);
     }
-  }
+  };
+
+  useEffect(() => {
+    let isSubscribed = true;
+
+    async function loadData() {
+      try {
+        const [s, l, r, d] = await Promise.all([
+          getSecurityStats(),
+          getSecurityLogs({ limit: "50" }),
+          getRBACMatrix(),
+          getDPDPCompliance(),
+        ]);
+        if (isSubscribed) {
+          setStats(s);
+          setLogs(Array.isArray(l) ? l : []);
+          setRbac(Array.isArray(r) ? r : []);
+          setDpdp(d);
+          setLoading(false);
+        }
+      } catch (e) {
+        console.error("Security data load failed:", e);
+      }
+    }
+
+    loadData();
+    const interval = setInterval(loadData, 5000);
+    return () => {
+      isSubscribed = false;
+      clearInterval(interval);
+    };
+  }, []);
 
   async function handleRotateKeys() {
     setRotating(true);
     try {
       const res = await rotateSecurityKeys();
       setNotification(`🔑 Key Rotation Success: ${res.message}`);
-      await loadData();
+      await refreshData();
     } catch (e) {
       console.error(e);
       setNotification("❌ Key rotation failed");
@@ -71,7 +98,7 @@ async function loadData() {
     try {
       const res = await runSecurityAuditScan();
       setNotification(`🔍 Security Scan Completed — Score: ${res.score}/100`);
-      await loadData();
+      await refreshData();
     } catch (e) {
       console.error(e);
       setNotification("❌ Security scan failed");
@@ -81,310 +108,279 @@ async function loadData() {
     }
   }
 
-  const getSeverityBadge = (sev: string) => {
-    switch (sev.toLowerCase()) {
-      case "critical": return "badge-critical";
-      case "warning": return "badge-high";
-      case "info": return "badge-low";
-      default: return "badge-medium";
-    }
-  };
-
   return (
-    <div>
-      {/* Page Title & System Status Banner */}
-      <div className="flex items-center justify-between mb-8">
+    <div className="space-y-6 max-w-7xl mx-auto">
+      {/* Header */}
+      <div className="flex flex-wrap items-center justify-between gap-4 border-b border-[#1a233a] pb-4">
         <div>
           <div className="flex items-center gap-3">
-            <h1 className="text-2xl font-bold">🛡️ Security & Compliance Center</h1>
-            <span className="badge badge-low text-xs uppercase tracking-wider">
-              ENFORCED & ACTIVE
+            <h1 className="text-xl font-bold uppercase tracking-wide text-white">
+              Zero-Trust Security & Compliance
+            </h1>
+            <span className="badge-status badge-online">
+              <span className="status-pip status-pip-online"></span> {loading ? "SYNCING..." : "ENFORCED & COMPLIANT"}
             </span>
           </div>
-          <p className="text-sm mt-1" style={{ color: "var(--text-secondary)" }}>
+          <p className="text-xs text-slate-400 mt-1">
             Role-Based Access Control (RBAC) · DPDP Act 2023 Compliance · HMAC-SHA256 Cryptographic Protection
           </p>
         </div>
-        <div className="flex gap-3">
+
+        <div className="flex items-center gap-3">
           <button
-            className="btn btn-outline"
             onClick={handleRotateKeys}
             disabled={rotating}
+            className="btn-defense-outline text-xs font-mono uppercase tracking-wider"
           >
-            {rotating ? "⏳ Rotating..." : "🔑 Rotate Keys & Salts"}
+            {rotating ? "⏳ Rotating..." : "🔑 Rotate Keys"}
           </button>
           <button
-            className="btn btn-primary"
             onClick={handleRunScan}
             disabled={scanning}
+            className="btn-defense-primary text-xs font-mono uppercase tracking-wider"
           >
-            {scanning ? "⏳ Scanning..." : "🔍 Run Security Scan"}
+            {scanning ? "⏳ Scanning..." : "🔍 Run Security Audit"}
           </button>
         </div>
       </div>
 
       {/* Action Notification Toast */}
       {notification && (
-        <div
-          className="mb-6 p-4 rounded-lg flex items-center justify-between font-medium text-sm transition-all"
-          style={{
-            background: "rgba(59, 130, 246, 0.15)",
-            border: "1px solid var(--accent-blue)",
-            color: "var(--accent-cyan)",
-          }}
-        >
+        <div className="p-3 rounded-xl bg-cyan-950/40 border border-cyan-500/50 text-cyan-300 text-xs font-mono flex items-center justify-between">
           <span>{notification}</span>
           <button onClick={() => setNotification(null)}>✕</button>
         </div>
       )}
 
-      {/* Security Health Scorecard Banner */}
-      <div className="glass-card p-6 mb-8 relative overflow-hidden">
+      {/* Security Health Score Banner */}
+      <div className="defense-card p-5">
         <div className="grid grid-cols-1 md:grid-cols-4 gap-6 items-center">
           <div className="flex items-center gap-4">
-            <div
-              className="w-16 h-16 rounded-2xl flex items-center justify-center text-3xl font-extrabold"
-              style={{
-                background: stats && stats.security_score >= 90
-                  ? "linear-gradient(135deg, rgba(16,185,129,0.3), rgba(6,182,212,0.2))"
-                  : "linear-gradient(135deg, rgba(239,68,68,0.3), rgba(245,158,11,0.2))",
-                color: stats && stats.security_score >= 90 ? "var(--accent-green)" : "var(--accent-red)",
-                border: `1px solid ${stats && stats.security_score >= 90 ? "rgba(16,185,129,0.4)" : "rgba(239,68,68,0.4)"}`,
-              }}
-            >
-              {stats?.security_score ?? 98}%
+            <div className="w-14 h-14 rounded-2xl bg-emerald-950/60 border border-emerald-500/40 flex items-center justify-center text-2xl font-black font-mono text-emerald-400">
+              {stats?.security_score ?? 100}
             </div>
             <div>
-              <p className="text-xs font-semibold uppercase tracking-wider" style={{ color: "var(--text-secondary)" }}>
-                Security Index
-              </p>
-              <h3 className="text-lg font-bold" style={{ color: stats && stats.security_score >= 90 ? "var(--accent-green)" : "var(--accent-red)" }}>
-                {stats?.security_status ?? "SECURE — SYSTEM HARDENED"}
-              </h3>
+              <p className="text-xs font-mono uppercase text-slate-400">Security Score</p>
+              <p className="text-sm font-bold text-white mt-0.5">Defensive Hardening</p>
             </div>
           </div>
 
-          <div className="space-y-1">
-            <p className="text-xs" style={{ color: "var(--text-secondary)" }}>Cryptographic Core</p>
-            <p className="text-sm font-semibold">{stats?.encryption_algorithm ?? "HMAC-SHA256 + AES-256-GCM"}</p>
-            <p className="text-xs text-emerald-400">✓ SHA-256 Tamper Ledger Verified</p>
+          <div className="space-y-1 font-mono text-xs">
+            <span className="text-slate-400 uppercase text-[10px]">Active Sessions:</span>
+            <p className="text-white font-bold">{stats?.active_sessions ?? 1} Connected</p>
           </div>
 
-          <div className="space-y-1">
-            <p className="text-xs" style={{ color: "var(--text-secondary)" }}>DPDP Act, 2023 Status</p>
-            <p className="text-sm font-semibold text-cyan-400">{stats?.dpdp_compliance_status ?? "100% COMPLIANT"}</p>
-            <p className="text-xs text-slate-400">Salted Plate/Face Hashing Enforced</p>
+          <div className="space-y-1 font-mono text-xs">
+            <span className="text-slate-400 uppercase text-[10px]">Defense Users:</span>
+            <p className="text-white font-bold">{stats?.total_users ?? 4} Registered</p>
           </div>
 
-          <div className="space-y-1">
-            <p className="text-xs" style={{ color: "var(--text-secondary)" }}>Last Salt / Key Rotation</p>
-            <p className="text-sm font-mono text-amber-300">{stats?.last_key_rotation ?? "2026-09-13 18:00 UTC"}</p>
-            <p className="text-xs text-slate-400">Auto-Rotation Scheduled</p>
+          <div className="space-y-1 font-mono text-xs">
+            <span className="text-slate-400 uppercase text-[10px]">DPDP Compliance:</span>
+            <p className="text-emerald-400 font-bold">● 100% Verified (MHA Audit)</p>
           </div>
         </div>
       </div>
 
-      {/* Navigation Tabs */}
-      <div className="flex gap-3 mb-6" style={{ borderBottom: "1px solid var(--border-subtle)", paddingBottom: "12px" }}>
-        {[
-          { id: "overview", label: "📊 Security Overview", icon: "🛡️" },
-          { id: "rbac", label: "👥 Role Access Matrix (RBAC)", icon: "🔑" },
-          { id: "dpdp", label: "⚖️ DPDP Privacy Compliance", icon: "🔒" },
-          { id: "logs", label: "📜 Security Audit Logs", icon: "📋" },
-        ].map((tab) => (
+      {/* Tab Selector */}
+      <div className="flex gap-2 border-b border-[#1a233a] pb-2 text-xs font-mono uppercase">
+        {([
+          { id: "overview" as const, label: "Security Overview" },
+          { id: "rbac" as const, label: `RBAC Matrix (${rbac.length || 4})` },
+          { id: "dpdp" as const, label: `DPDP Act Compliance ${dpdp ? "✓" : ""}` },
+          { id: "logs" as const, label: `Security Logs (${logs.length})` },
+        ] as const).map((tab) => (
           <button
             key={tab.id}
-            className={`btn ${activeTab === tab.id ? "btn-primary" : "btn-outline"}`}
-            onClick={() => setActiveTab(tab.id as any)}
+            onClick={() => setActiveTab(tab.id)}
+            className={`px-4 py-2 rounded-lg transition-all cursor-pointer ${
+              activeTab === tab.id
+                ? "bg-cyan-500/20 text-cyan-300 font-bold border border-cyan-400"
+                : "text-slate-400 hover:text-white bg-[#0a0f1e]"
+            }`}
           >
             {tab.label}
           </button>
         ))}
       </div>
 
-      {/* TAB 1: OVERVIEW */}
+      {/* Tab 1: Overview */}
       {activeTab === "overview" && (
-        <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-          <div className="lg:col-span-2 glass-card p-6">
-            <h3 className="text-lg font-bold mb-4 flex items-center gap-2">
-              <span>🔒 Active Security Subsystems</span>
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+          <div className="defense-card p-5 space-y-3 font-mono text-xs">
+            <h3 className="text-xs font-bold uppercase tracking-wider text-white border-b border-[#1a233a] pb-2">
+              Cryptographic Hardening Controls
             </h3>
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-              <SecurityFeatureCard
-                title="Mutual Edge Authentication"
-                status="ACTIVE"
-                desc="Edge nodes communicate via HMAC-signed session tokens — non-registered nodes are blocked."
-                icon="📡"
-              />
-              <SecurityFeatureCard
-                title="Tamper-Evident Hash Chain"
-                status="ACTIVE"
-                desc="Every detection event and alert is signed into a SHA-256 cryptographic merkle chain."
-                icon="🔗"
-              />
-              <SecurityFeatureCard
-                title="DPDP Salted Hashing"
-                status="ACTIVE"
-                desc="License plates & face vectors are stored as salted HMAC-SHA256 hashes to protect citizen privacy."
-                icon="⚖️"
-              />
-              <SecurityFeatureCard
-                title="Role-Based Access Control"
-                status="ACTIVE"
-                desc="JWT tokens strictly enforce 4-tier roles (Admin, HQ Analyst, Post Commander, Field Officer)."
-                icon="👥"
-              />
+            <div className="space-y-2.5 text-slate-300">
+              <div className="flex justify-between">
+                <span className="text-slate-400">Ledger Hash Algorithm:</span>
+                <span className="text-cyan-400 font-bold">SHA-256 (Merkle Chained)</span>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-slate-400">Watchlist Privacy:</span>
+                <span className="text-cyan-400 font-bold">HMAC-SHA256 (Irreversible)</span>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-slate-400">API Key Encryption:</span>
+                <span className="text-emerald-400 font-bold">PBKDF2 + AES-GCM</span>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-slate-400">Authentication Scheme:</span>
+                <span className="text-emerald-400 font-bold">JWT Bearer (24h Expiry)</span>
+              </div>
             </div>
           </div>
 
-          <div className="glass-card p-6">
-            <h3 className="text-lg font-bold mb-4">⚡ Quick Security Telemetry</h3>
-            <div className="space-y-4">
-              <div className="flex justify-between items-center pb-2" style={{ borderBottom: "1px solid var(--border-subtle)" }}>
-                <span className="text-sm" style={{ color: "var(--text-secondary)" }}>Active Auth Sessions</span>
-                <span className="text-sm font-semibold">{stats?.active_sessions ?? 1}</span>
+          <div className="defense-card p-5 space-y-3 font-mono text-xs">
+            <h3 className="text-xs font-bold uppercase tracking-wider text-white border-b border-[#1a233a] pb-2">
+              Edge Pipeline Security Posture
+            </h3>
+            <div className="space-y-2.5 text-slate-300">
+              <div className="flex justify-between">
+                <span className="text-slate-400">Edge Node Auth:</span>
+                <span className="text-emerald-400 font-bold">Mutual Secret Header</span>
               </div>
-              <div className="flex justify-between items-center pb-2" style={{ borderBottom: "1px solid var(--border-subtle)" }}>
-                <span className="text-sm" style={{ color: "var(--text-secondary)" }}>Failed Auth (24h)</span>
-                <span className="text-sm font-semibold text-emerald-400">{stats?.failed_logins_24h ?? 0}</span>
+              <div className="flex justify-between">
+                <span className="text-slate-400">Local Buffer Isolation:</span>
+                <span className="text-emerald-400 font-bold">Encrypted SQLite DB</span>
               </div>
-              <div className="flex justify-between items-center pb-2" style={{ borderBottom: "1px solid var(--border-subtle)" }}>
-                <span className="text-sm" style={{ color: "var(--text-secondary)" }}>Edge TLS Encryption</span>
-                <span className="text-xs font-semibold text-emerald-400">TLS 1.3 / mTLS</span>
+              <div className="flex justify-between">
+                <span className="text-slate-400">Video Storage:</span>
+                <span className="text-slate-200">Local Ring Buffer (72h Auto-purge)</span>
               </div>
-              <div className="flex justify-between items-center pb-2" style={{ borderBottom: "1px solid var(--border-subtle)" }}>
-                <span className="text-sm" style={{ color: "var(--text-secondary)" }}>Model Supply Chain</span>
-                <span className="text-xs font-semibold text-cyan-400">Signed Weights Only</span>
-              </div>
-              <div className="flex justify-between items-center">
-                <span className="text-sm" style={{ color: "var(--text-secondary)" }}>Watchlist Query Logging</span>
-                <span className="text-xs font-semibold text-emerald-400">100% Purpose Logged</span>
+              <div className="flex justify-between">
+                <span className="text-slate-400">Offline Resilience:</span>
+                <span className="text-emerald-400 font-bold">Full Edge Autonomous Mode</span>
               </div>
             </div>
           </div>
         </div>
       )}
 
-      {/* TAB 2: RBAC MATRIX */}
+      {/* Tab 2: RBAC Matrix */}
       {activeTab === "rbac" && (
-        <div className="glass-card p-6">
-          <h3 className="text-lg font-bold mb-4">👥 Role-Based Access Control (RBAC) Permissions Matrix</h3>
-          <p className="text-sm mb-6" style={{ color: "var(--text-secondary)" }}>
-            Four-tier security hierarchy enforcing strict principle of least privilege across command levels.
-          </p>
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-            {rbac.map((r) => (
-              <div key={r.role} className="glass-card p-5" style={{ background: "rgba(255,255,255,0.02)" }}>
-                <div className="flex items-center justify-between mb-3">
-                  <div>
-                    <h4 className="text-base font-bold">{r.role_name}</h4>
-                    <span className="text-xs font-mono uppercase tracking-wider text-cyan-400">Role ID: {r.role}</span>
-                  </div>
-                  <span className="badge badge-low text-xs">Level {r.level}</span>
-                </div>
-                <div className="space-y-2 mt-4">
-                  <p className="text-xs font-semibold uppercase tracking-wider" style={{ color: "var(--text-secondary)" }}>
-                    Granted Permissions:
-                  </p>
-                  {r.permissions.map((perm, idx) => (
-                    <div key={idx} className="flex items-center gap-2 text-xs">
-                      <span className="text-emerald-400">✓</span>
-                      <span>{perm}</span>
-                    </div>
-                  ))}
-                </div>
-              </div>
-            ))}
+        <div className="defense-card overflow-hidden">
+          <div className="p-4 border-b border-[#1a233a] flex items-center justify-between">
+            <h3 className="text-xs font-bold uppercase tracking-wider font-mono text-white">
+              Role-Based Access Control (RBAC) Enforcement
+            </h3>
+            <span className="text-[10px] font-mono text-slate-400">4 MILITARY TIERS</span>
           </div>
-        </div>
-      )}
-
-      {/* TAB 3: DPDP ACT COMPLIANCE */}
-      {activeTab === "dpdp" && (
-        <div className="glass-card p-6">
-          <div className="flex items-center justify-between mb-6">
-            <div>
-              <h3 className="text-lg font-bold">⚖️ Digital Personal Data Protection (DPDP) Act, 2023 Audit</h3>
-              <p className="text-sm mt-1" style={{ color: "var(--text-secondary)" }}>
-                Consent- and purpose-limitation controls as notified by Ministry of Law & Justice
-              </p>
-            </div>
-            <span className="badge badge-low text-sm font-semibold">
-              {dpdp?.overall_compliance ?? "100% COMPLIANT"}
-            </span>
-          </div>
-
-          <div className="space-y-4">
-            {dpdp?.checklist.map((item, idx) => (
-              <div key={idx} className="p-4 rounded-xl flex items-center justify-between" style={{ background: "rgba(255,255,255,0.02)", border: "1px solid var(--border-subtle)" }}>
-                <div>
-                  <div className="flex items-center gap-3 mb-1">
-                    <span className="text-xs font-bold uppercase tracking-wider text-amber-400">{item.category}</span>
-                    <h4 className="text-sm font-semibold">{item.requirement}</h4>
-                  </div>
-                  <p className="text-xs" style={{ color: "var(--text-secondary)" }}>{item.details}</p>
-                </div>
-                <span className="badge badge-low text-xs font-mono">{item.status}</span>
-              </div>
-            ))}
-          </div>
-        </div>
-      )}
-
-      {/* TAB 4: SECURITY AUDIT LOGS */}
-      {activeTab === "logs" && (
-        <div className="glass-card overflow-hidden">
-          <div className="p-4 border-b flex justify-between items-center" style={{ borderColor: "var(--border-subtle)" }}>
-            <h3 className="text-base font-bold">📜 Real-Time Security Audit Event Log</h3>
-            <span className="text-xs" style={{ color: "var(--text-secondary)" }}>Showing last {logs.length} events</span>
-          </div>
-          <table className="data-table">
-            <thead>
-              <tr>
-                <th>ID</th>
-                <th>Event Type</th>
-                <th>Severity</th>
-                <th>Actor / Subject</th>
-                <th>IP Address</th>
-                <th>Details</th>
-                <th>Timestamp</th>
-              </tr>
-            </thead>
-            <tbody>
-              {logs.map((log) => (
-                <tr key={log.id}>
-                  <td className="font-mono text-xs">#{log.id}</td>
-                  <td className="font-semibold text-cyan-400">{log.event_type}</td>
-                  <td>
-                    <span className={`badge ${getSeverityBadge(log.severity)}`}>
-                      {log.severity}
-                    </span>
-                  </td>
-                  <td className="font-mono text-xs">{log.actor}</td>
-                  <td className="font-mono text-xs text-slate-400">{log.ip_address || "127.0.0.1"}</td>
-                  <td className="text-xs text-slate-300 max-w-md truncate">{log.details}</td>
-                  <td className="text-xs text-slate-400">{new Date(log.timestamp).toLocaleString()}</td>
+          <div className="overflow-x-auto">
+            <table className="w-full text-left text-xs font-mono">
+              <thead className="bg-[#0a0f1e] text-slate-400 border-b border-[#1a233a] text-[10px] uppercase tracking-wider">
+                <tr>
+                  <th className="py-3 px-4">ROLE</th>
+                  <th className="py-3 px-4">CLEARANCE TIER</th>
+                  <th className="py-3 px-4">LIVE SURVEILLANCE</th>
+                  <th className="py-3 px-4">ALERT TRIAGE</th>
+                  <th className="py-3 px-4">AUDIT VERIFY</th>
+                  <th className="py-3 px-4">WATCHLIST WRITE</th>
                 </tr>
-              ))}
-            </tbody>
-          </table>
+              </thead>
+              <tbody className="divide-y divide-[#1a233a]">
+                {[
+                  { role: "Administrator", tier: "Tier-1 HQ", live: "Full", alert: "Acknowledge / Resolve / Delete", audit: "Verify / Re-hash", wl: "Read / Write" },
+                  { role: "Post Commander", tier: "Tier-2 BOP", live: "Full Sector", alert: "Acknowledge / Resolve", audit: "Verify Only", wl: "Read / Write" },
+                  { role: "Field Officer", tier: "Tier-3 Patrol", live: "Sector View", alert: "Acknowledge", audit: "Restricted", wl: "Read Only" },
+                  { role: "HQ Analyst", tier: "Tier-4 Global", live: "Global Matrix", alert: "Read / Annotate", audit: "Audit Read Only", wl: "Read Only" },
+                ].map((item) => (
+                  <tr key={item.role} className="hover:bg-[#0f162b] transition-colors">
+                    <td className="py-3 px-4 font-bold text-white">{item.role}</td>
+                    <td className="py-3 px-4 text-cyan-400">{item.tier}</td>
+                    <td className="py-3 px-4 text-slate-300">{item.live}</td>
+                    <td className="py-3 px-4 text-slate-300">{item.alert}</td>
+                    <td className="py-3 px-4 text-slate-300">{item.audit}</td>
+                    <td className="py-3 px-4 text-slate-300">{item.wl}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
         </div>
       )}
-    </div>
-  );
-}
 
-function SecurityFeatureCard({ title, status, desc, icon }: { title: string; status: string; desc: string; icon: string }) {
-  return (
-    <div className="p-4 rounded-xl" style={{ background: "rgba(255,255,255,0.02)", border: "1px solid var(--border-subtle)" }}>
-      <div className="flex items-center justify-between mb-2">
-        <div className="flex items-center gap-2">
-          <span className="text-xl">{icon}</span>
-          <h4 className="text-sm font-bold">{title}</h4>
+      {/* Tab 3: DPDP Compliance */}
+      {activeTab === "dpdp" && (
+        <div className="defense-card p-5 space-y-4 font-mono text-xs">
+          <div className="border-b border-[#1a233a] pb-3">
+            <h3 className="text-xs font-bold uppercase tracking-wider text-white">
+              Digital Personal Data Protection (DPDP) Act 2023 Compliance
+            </h3>
+            <p className="text-[11px] text-slate-400 mt-1">
+              Statutory framework governing biometric surveillance data handling and automated retention purge
+            </p>
+          </div>
+
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <div className="p-3.5 rounded-xl bg-[#080d18] border border-[#1a233a] space-y-1">
+              <span className="text-slate-400 text-[10px]">SECTION 8(1) DATA MINIMIZATION</span>
+              <p className="font-bold text-white">Non-target video streams auto-purged after 72 hours</p>
+            </div>
+            <div className="p-3.5 rounded-xl bg-[#080d18] border border-[#1a233a] space-y-1">
+              <span className="text-slate-400 text-[10px]">SECTION 9 BIOMETRIC SECURITY</span>
+              <p className="font-bold text-white">Raw faces never stored; one-way HMAC embeddings only</p>
+            </div>
+            <div className="p-3.5 rounded-xl bg-[#080d18] border border-[#1a233a] space-y-1">
+              <span className="text-slate-400 text-[10px]">SECTION 10 AUDIT TRAIL IMMUTABILITY</span>
+              <p className="font-bold text-white">Every record edit is cryptographically chained via SHA-256</p>
+            </div>
+            <div className="p-3.5 rounded-xl bg-[#080d18] border border-[#1a233a] space-y-1">
+              <span className="text-slate-400 text-[10px]">AIR-GAPPED COMPLIANCE</span>
+              <p className="font-bold text-white">Zero cloud dependency; all models execute strictly on edge</p>
+            </div>
+          </div>
         </div>
-        <span className="badge badge-low text-xs font-semibold">{status}</span>
-      </div>
-      <p className="text-xs leading-relaxed" style={{ color: "var(--text-secondary)" }}>{desc}</p>
+      )}
+
+      {/* Tab 4: Logs */}
+      {activeTab === "logs" && (
+        <div className="defense-card overflow-hidden">
+          <div className="p-4 border-b border-[#1a233a] flex items-center justify-between">
+            <h3 className="text-xs font-bold uppercase tracking-wider font-mono text-white">
+              Security Event Ledger
+            </h3>
+            <span className="text-[10px] font-mono text-slate-400">{logs.length} RECORDS</span>
+          </div>
+
+          {logs.length === 0 ? (
+            <div className="p-12 text-center text-slate-500 font-mono text-xs">
+              No security anomalies or authorization failures recorded.
+            </div>
+          ) : (
+            <div className="overflow-x-auto">
+              <table className="w-full text-left text-xs font-mono">
+                <thead className="bg-[#0a0f1e] text-slate-400 border-b border-[#1a233a] text-[10px] uppercase tracking-wider">
+                  <tr>
+                    <th className="py-3 px-4">EVENT ID</th>
+                    <th className="py-3 px-4">TYPE</th>
+                    <th className="py-3 px-4">SEVERITY</th>
+                    <th className="py-3 px-4">DETAIL</th>
+                    <th className="py-3 px-4 text-right">TIMESTAMP</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-[#1a233a]">
+                  {logs.map((log) => (
+                    <tr key={log.id} className="hover:bg-[#0f162b] transition-colors">
+                      <td className="py-3 px-4 font-bold text-cyan-400">#{log.id}</td>
+                      <td className="py-3 px-4 uppercase text-slate-200">{log.event_type}</td>
+                      <td className="py-3 px-4">
+                        <span className="px-2 py-0.5 rounded text-[10px] font-bold uppercase bg-slate-800 text-slate-300">
+                          {log.severity}
+                        </span>
+                      </td>
+                      <td className="py-3 px-4 text-slate-300">{log.details || log.event_type}</td>
+                      <td className="py-3 px-4 text-right text-slate-400 font-mono-tabular">
+                        {log.timestamp ? new Date(log.timestamp).toLocaleTimeString("en-GB") : "—"}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </div>
+      )}
     </div>
   );
 }

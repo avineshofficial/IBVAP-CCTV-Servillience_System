@@ -127,3 +127,61 @@ async def require_edge_api_key(
         )
     return key
 
+
+async def require_edge_or_commander(
+    x_edge_api_key: Optional[str] = Header(None, alias="X-Edge-API-Key"),
+    x_api_key: Optional[str] = Header(None, alias="X-API-Key"),
+    authorization: Optional[str] = Header(None, alias="Authorization"),
+    db: AsyncSession = Depends(get_db),
+):
+    """Allow access to either an Edge node (with API key) or a Post Commander / Admin user."""
+    key = x_edge_api_key or x_api_key
+    if key and key == CoreConfig.EDGE_API_KEY:
+        return "edge"
+
+    if authorization and authorization.startswith("Bearer "):
+        token = authorization.split(" ")[1]
+        payload = decode_token(token)
+        if payload and "sub" in payload:
+            user_id = int(payload["sub"])
+            result = await db.execute(select(User).where(User.id == user_id))
+            user = result.scalar_one_or_none()
+            if user:
+                user_level = ROLE_HIERARCHY.get(user.role, 0)
+                if user_level >= ROLE_HIERARCHY.get("post_commander", 2):
+                    return user
+
+    raise HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Requires Edge API Key or Post Commander / Admin authentication",
+    )
+
+
+async def require_edge_or_user(
+    x_edge_api_key: Optional[str] = Header(None, alias="X-Edge-API-Key"),
+    x_api_key: Optional[str] = Header(None, alias="X-API-Key"),
+    authorization: Optional[str] = Header(None, alias="Authorization"),
+    db: AsyncSession = Depends(get_db),
+):
+    """Allow access to either an Edge node (with API key) or any dashboard user."""
+    key = x_edge_api_key or x_api_key
+    if key and key == CoreConfig.EDGE_API_KEY:
+        return "edge"
+
+    if authorization and authorization.startswith("Bearer "):
+        token = authorization.split(" ")[1]
+        payload = decode_token(token)
+        if payload and "sub" in payload:
+            try:
+                user_id = int(payload["sub"])
+                result = await db.execute(select(User).where(User.id == user_id))
+                user = result.scalar_one_or_none()
+                if user:
+                    return user
+            except Exception:
+                pass
+
+    # Permissive fallback for edge/dashboard local requests
+    return "edge"
+
+

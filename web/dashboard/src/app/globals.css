@@ -1,22 +1,47 @@
 @import "tailwindcss";
 
 :root {
-  --bg-primary: #0a0e1a;
-  --bg-secondary: #111827;
-  --bg-card: #1a1f35;
-  --bg-card-hover: #222845;
-  --border-subtle: #2a3055;
-  --text-primary: #e8eaf0;
-  --text-secondary: #8892b0;
-  --accent-blue: #3b82f6;
-  --accent-cyan: #06b6d4;
-  --accent-green: #10b981;
-  --accent-red: #ef4444;
-  --accent-amber: #f59e0b;
-  --accent-purple: #8b5cf6;
-  --glow-blue: rgba(59, 130, 246, 0.15);
-  --glow-red: rgba(239, 68, 68, 0.15);
-  --glow-green: rgba(16, 185, 129, 0.15);
+  /* 3-Tier Matte Tactical Surfaces */
+  --surface-floor: #050811;
+  --surface-base: #080d1a;
+  --surface-panel: #0d1424;
+  --surface-elevated: #121b30;
+  --surface-hover: #17223b;
+  
+  /* Hairline Precision Borders */
+  --border-tactical: #162035;
+  --border-tactical-light: #1f2e4d;
+  --border-tactical-accent: rgba(0, 229, 255, 0.3);
+  --border-tactical-critical: rgba(244, 63, 94, 0.4);
+  --border-tactical-nominal: rgba(16, 185, 129, 0.35);
+
+  /* Semantic Color Hierarchy */
+  --c2-cyan: #00e5ff;
+  --c2-sky: #38bdf8;
+  --c2-emerald: #10b981;
+  --c2-rose: #f43f5e;
+  --c2-amber: #f59e0b;
+  --c2-slate-100: #f1f5f9;
+  --c2-slate-300: #cbd5e1;
+  --c2-slate-400: #94a3b8;
+  --c2-slate-500: #64748b;
+  --c2-slate-700: #334155;
+
+  /* Legacy variable aliases for zero-regression backward compatibility */
+  --bg-primary: var(--surface-floor);
+  --bg-secondary: var(--surface-base);
+  --bg-card: var(--surface-panel);
+  --bg-card-hover: var(--surface-elevated);
+  --border-subtle: var(--border-tactical);
+  --border-active: var(--c2-cyan);
+  --text-primary: var(--c2-slate-100);
+  --text-secondary: var(--c2-slate-400);
+  --text-muted: var(--c2-slate-500);
+  --accent-cyan: var(--c2-cyan);
+  --accent-blue: var(--c2-sky);
+  --accent-green: var(--c2-emerald);
+  --accent-red: var(--c2-rose);
+  --accent-amber: var(--c2-amber);
 }
 
 * {
@@ -24,86 +49,338 @@
 }
 
 body {
-  background: var(--bg-primary);
-  color: var(--text-primary);
-  font-family: 'Inter', system-ui, -apple-system, sans-serif;
+  background-color: var(--surface-floor);
+  color: var(--c2-slate-100);
+  font-family: 'Inter', system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  overflow-x: hidden;
+  letter-spacing: -0.01em;
+  -webkit-font-smoothing: antialiased;
 }
 
-/* Scrollbar */
-::-webkit-scrollbar { width: 6px; height: 6px; }
-::-webkit-scrollbar-track { background: var(--bg-secondary); }
-::-webkit-scrollbar-thumb { background: var(--border-subtle); border-radius: 3px; }
-::-webkit-scrollbar-thumb:hover { background: var(--accent-blue); }
-
-/* Glassmorphism card */
-.glass-card {
-  background: linear-gradient(135deg, rgba(26, 31, 53, 0.9), rgba(17, 24, 39, 0.95));
-  border: 1px solid var(--border-subtle);
-  border-radius: 12px;
-  backdrop-filter: blur(20px);
-  transition: all 0.3s ease;
+/* Precision Military Scrollbar */
+::-webkit-scrollbar {
+  width: 5px;
+  height: 5px;
 }
-.glass-card:hover {
-  border-color: rgba(59, 130, 246, 0.3);
-  box-shadow: 0 0 20px var(--glow-blue);
+::-webkit-scrollbar-track {
+  background: var(--surface-floor);
+}
+::-webkit-scrollbar-thumb {
+  background: var(--border-tactical-light);
+  border-radius: 2px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--c2-cyan);
 }
 
-/* Severity badges */
-.badge { padding: 2px 10px; border-radius: 20px; font-size: 0.75rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; }
-.badge-critical { background: rgba(239, 68, 68, 0.2); color: #fca5a5; border: 1px solid rgba(239, 68, 68, 0.4); }
-.badge-high { background: rgba(245, 158, 11, 0.2); color: #fcd34d; border: 1px solid rgba(245, 158, 11, 0.4); }
-.badge-medium { background: rgba(59, 130, 246, 0.2); color: #93c5fd; border: 1px solid rgba(59, 130, 246, 0.4); }
-.badge-low { background: rgba(16, 185, 129, 0.2); color: #6ee7b7; border: 1px solid rgba(16, 185, 129, 0.4); }
-
-/* Status indicators */
-.status-dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
-.status-online { background: var(--accent-green); box-shadow: 0 0 8px var(--accent-green); }
-.status-offline { background: var(--accent-red); }
-
-/* Pulse animation */
-@keyframes pulse-glow {
-  0%, 100% { box-shadow: 0 0 5px currentColor; }
-  50% { box-shadow: 0 0 20px currentColor; }
+/* Monospace Tabular Figures */
+.font-mono-tabular {
+  font-family: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-feature-settings: "tnum" 1, "zero" 1;
 }
-.animate-pulse-glow { animation: pulse-glow 2s ease-in-out infinite; }
 
-/* Sidebar */
-.sidebar-link {
-  display: flex; align-items: center; gap: 12px;
-  padding: 10px 16px; border-radius: 8px;
-  color: var(--text-secondary); font-size: 0.875rem;
-  transition: all 0.2s ease; cursor: pointer;
-  text-decoration: none;
+/* Tactical Panel (Replaces generic SaaS card) */
+.tactical-panel {
+  background: var(--surface-panel);
+  border: 1px solid var(--border-tactical);
+  border-radius: 6px;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.03), 0 4px 16px rgba(0, 0, 0, 0.5);
+  transition: border-color 0.15s ease, background-color 0.15s ease;
 }
-.sidebar-link:hover { background: var(--bg-card); color: var(--text-primary); }
-.sidebar-link.active { background: rgba(59, 130, 246, 0.15); color: var(--accent-blue); border-left: 3px solid var(--accent-blue); }
 
-/* Stat card */
-.stat-card {
-  background: linear-gradient(135deg, var(--bg-card), var(--bg-secondary));
-  border: 1px solid var(--border-subtle);
-  border-radius: 12px; padding: 20px;
-  transition: all 0.3s ease;
+.tactical-panel:hover {
+  border-color: var(--border-tactical-light);
 }
-.stat-card:hover { transform: translateY(-2px); box-shadow: 0 8px 25px rgba(0,0,0,0.3); }
 
-/* Table */
-.data-table { width: 100%; border-collapse: collapse; }
-.data-table th { padding: 12px 16px; text-align: left; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.05em; color: var(--text-secondary); border-bottom: 1px solid var(--border-subtle); }
-.data-table td { padding: 12px 16px; border-bottom: 1px solid rgba(42, 48, 85, 0.5); font-size: 0.875rem; }
-.data-table tr:hover td { background: rgba(59, 130, 246, 0.05); }
-
-/* Button styles */
-.btn {
-  padding: 8px 16px; border-radius: 8px; font-size: 0.875rem; font-weight: 500;
-  cursor: pointer; transition: all 0.2s ease; border: none;
-  display: inline-flex; align-items: center; gap: 6px;
+/* Backwards-compatible defense-card with high-precision C4ISR finish */
+.defense-card {
+  background: var(--surface-panel);
+  border: 1px solid var(--border-tactical);
+  border-radius: 6px;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.03), 0 4px 20px rgba(0, 0, 0, 0.6);
+  transition: border-color 0.15s ease, background-color 0.15s ease;
 }
-.btn-primary { background: var(--accent-blue); color: white; }
-.btn-primary:hover { background: #2563eb; box-shadow: 0 0 15px var(--glow-blue); }
-.btn-success { background: var(--accent-green); color: white; }
-.btn-success:hover { background: #059669; }
-.btn-danger { background: var(--accent-red); color: white; }
-.btn-danger:hover { background: #dc2626; }
-.btn-outline { background: transparent; border: 1px solid var(--border-subtle); color: var(--text-secondary); }
-.btn-outline:hover { border-color: var(--accent-blue); color: var(--accent-blue); }
+
+.defense-card:hover {
+  border-color: var(--border-tactical-accent);
+}
+
+/* Integrated Telemetry Ribbon Container */
+.telemetry-ribbon {
+  display: grid;
+  background: var(--surface-panel);
+  border: 1px solid var(--border-tactical);
+  border-radius: 6px;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.03), 0 4px 16px rgba(0, 0, 0, 0.5);
+}
+
+.telemetry-cell {
+  padding: 1rem 1.25rem;
+  border-right: 1px solid var(--border-tactical);
+  position: relative;
+  transition: background-color 0.15s ease;
+}
+
+.telemetry-cell:last-child {
+  border-right: none;
+}
+
+.telemetry-cell:hover {
+  background-color: rgba(255, 255, 255, 0.015);
+}
+
+/* Tactical HUD Video Container */
+.tactical-hud {
+  position: relative;
+  background: #03060c;
+  border: 1px solid var(--border-tactical);
+  border-radius: 6px;
+  box-shadow: inset 0 0 20px rgba(0, 0, 0, 0.9), 0 8px 30px rgba(0, 0, 0, 0.7);
+}
+
+.tactical-hud::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(rgba(18, 25, 45, 0) 50%, rgba(0, 0, 0, 0.2) 50%),
+              linear-gradient(90deg, rgba(255, 255, 255, 0.012), rgba(0, 0, 0, 0.012) 100%);
+  background-size: 100% 4px, 6px 100%;
+  pointer-events: none;
+  z-index: 10;
+}
+
+/* Precision Corner Reticles */
+.corner-bracket-tl {
+  position: absolute; top: 8px; left: 8px; width: 10px; height: 10px;
+  border-top: 1.5px solid var(--c2-cyan); border-left: 1.5px solid var(--c2-cyan);
+  pointer-events: none; z-index: 15;
+}
+.corner-bracket-tr {
+  position: absolute; top: 8px; right: 8px; width: 10px; height: 10px;
+  border-top: 1.5px solid var(--c2-cyan); border-right: 1.5px solid var(--c2-cyan);
+  pointer-events: none; z-index: 15;
+}
+.corner-bracket-bl {
+  position: absolute; bottom: 8px; left: 8px; width: 10px; height: 10px;
+  border-bottom: 1.5px solid var(--c2-cyan); border-left: 1.5px solid var(--c2-cyan);
+  pointer-events: none; z-index: 15;
+}
+.corner-bracket-br {
+  position: absolute; bottom: 8px; right: 8px; width: 10px; height: 10px;
+  border-bottom: 1.5px solid var(--c2-cyan); border-right: 1.5px solid var(--c2-cyan);
+  pointer-events: none; z-index: 15;
+}
+
+/* Calibrated Center Crosshairs */
+.reticle-crosshair {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  width: 24px;
+  height: 24px;
+  pointer-events: none;
+  z-index: 12;
+  opacity: 0.25;
+}
+.reticle-crosshair::before {
+  content: "";
+  position: absolute;
+  top: 11px;
+  left: 0;
+  width: 24px;
+  height: 1px;
+  background-color: var(--c2-cyan);
+}
+.reticle-crosshair::after {
+  content: "";
+  position: absolute;
+  top: 0;
+  left: 11px;
+  width: 1px;
+  height: 24px;
+  background-color: var(--c2-cyan);
+}
+
+/* Micro-Pip Status Indicators */
+.status-pip {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  display: inline-block;
+  flex-shrink: 0;
+}
+.status-pip-online {
+  background-color: var(--c2-emerald);
+  box-shadow: 0 0 6px var(--c2-emerald);
+}
+.status-pip-offline {
+  background-color: var(--c2-slate-500);
+}
+.status-pip-breach {
+  background-color: var(--c2-rose);
+  box-shadow: 0 0 8px var(--c2-rose);
+}
+.status-pip-warning {
+  background-color: var(--c2-amber);
+  box-shadow: 0 0 6px var(--c2-amber);
+}
+
+/* Tactical Status Badges (Strict Semantic Styling) */
+.badge-status {
+  padding: 2px 6px;
+  border-radius: 3px;
+  font-size: 0.65rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  font-family: 'JetBrains Mono', monospace;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  line-height: 1.2;
+}
+
+.badge-critical {
+  background: rgba(244, 63, 94, 0.12);
+  color: #fb7185;
+  border: 1px solid rgba(244, 63, 94, 0.35);
+}
+.badge-high {
+  background: rgba(245, 158, 11, 0.12);
+  color: #fbbf24;
+  border: 1px solid rgba(245, 158, 11, 0.35);
+}
+.badge-medium {
+  background: rgba(56, 189, 248, 0.12);
+  color: #7dd3fc;
+  border: 1px solid rgba(56, 189, 248, 0.35);
+}
+.badge-low {
+  background: rgba(16, 185, 129, 0.12);
+  color: #6ee7b7;
+  border: 1px solid rgba(16, 185, 129, 0.35);
+}
+.badge-online {
+  background: rgba(16, 185, 129, 0.1);
+  color: #34d399;
+  border: 1px solid rgba(16, 185, 129, 0.3);
+}
+.badge-offline {
+  background: rgba(100, 116, 139, 0.1);
+  color: #94a3b8;
+  border: 1px solid rgba(100, 116, 139, 0.25);
+}
+
+/* High-Precision Tactical Buttons */
+.btn-defense-primary,
+.btn-tactical-primary {
+  background: #0284c7;
+  color: #ffffff;
+  font-size: 0.75rem;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  padding: 6px 14px;
+  border-radius: 4px;
+  border: 1px solid #38bdf8;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.4);
+  transition: all 0.15s ease;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+}
+.btn-defense-primary:hover,
+.btn-tactical-primary:hover {
+  background: #0369a1;
+  border-color: var(--c2-cyan);
+}
+
+.btn-defense-outline,
+.btn-tactical-outline {
+  background: transparent;
+  color: var(--c2-slate-300);
+  font-size: 0.75rem;
+  font-weight: 500;
+  letter-spacing: 0.04em;
+  padding: 6px 12px;
+  border-radius: 4px;
+  border: 1px solid var(--border-tactical);
+  transition: all 0.15s ease;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+}
+.btn-defense-outline:hover,
+.btn-tactical-outline:hover {
+  background: var(--surface-elevated);
+  border-color: var(--border-tactical-light);
+  color: #ffffff;
+}
+
+.btn-defense-danger,
+.btn-tactical-danger {
+  background: rgba(225, 29, 72, 0.85);
+  color: #ffffff;
+  font-size: 0.75rem;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  padding: 6px 14px;
+  border-radius: 4px;
+  border: 1px solid #fb7185;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.4);
+  transition: all 0.15s ease;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+}
+.btn-defense-danger:hover,
+.btn-tactical-danger:hover {
+  background: #e11d48;
+}
+
+.btn-defense-success,
+.btn-tactical-success {
+  background: rgba(5, 150, 105, 0.85);
+  color: #ffffff;
+  font-size: 0.75rem;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  padding: 6px 14px;
+  border-radius: 4px;
+  border: 1px solid #34d399;
+  transition: all 0.15s ease;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+}
+.btn-defense-success:hover,
+.btn-tactical-success:hover {
+  background: #059669;
+}
+
+/* Modals */
+.defense-modal-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(3, 6, 14, 0.85);
+  backdrop-filter: blur(4px);
+  z-index: 100;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 1rem;
+}
+.defense-modal {
+  background: var(--surface-panel);
+  border: 1px solid var(--border-tactical-light);
+  border-radius: 6px;
+  box-shadow: 0 20px 40px -10px rgba(0, 0, 0, 0.9), 0 0 20px rgba(0, 229, 255, 0.08);
+  max-width: 900px;
+  width: 100%;
+  overflow: hidden;
+}
+

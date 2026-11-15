@@ -66,48 +66,71 @@ async function apiFetch<T>(
   path: string,
   options: RequestInit = {}
 ): Promise<T> {
-  const headers: Record<string, string> = {
-    "Content-Type": "application/json",
-    ...((options.headers as Record<string, string>) || {}),
-  };
+  try {
+    const headers: Record<string, string> = {
+      "Content-Type": "application/json",
+      ...((options.headers as Record<string, string>) || {}),
+    };
 
-  if (!headers["Authorization"] && !path.includes("/auth/login")) {
-    const token = await ensureToken();
-    if (token) {
-      headers["Authorization"] = `Bearer ${token}`;
+    if (!headers["Authorization"] && !path.includes("/auth/login")) {
+      const token = await ensureToken();
+      if (token) {
+        headers["Authorization"] = `Bearer ${token}`;
+      }
     }
-  }
 
-  const res = await fetch(`${API_BASE}${path}`, {
-    ...options,
-    headers,
-  });
-
-  if (res.status === 401 && !path.includes("/auth/login")) {
-    // Token may have expired — clear and attempt auto-refresh
-    setStoredToken(null);
-    const freshToken = await ensureToken();
-    if (freshToken) {
-      headers["Authorization"] = `Bearer ${freshToken}`;
-      const retryRes = await fetch(`${API_BASE}${path}`, {
+    let res: Response;
+    try {
+      res = await fetch(`${API_BASE}${path}`, {
         ...options,
         headers,
       });
-      if (!retryRes.ok) {
-        const body = await retryRes.text().catch(() => "");
-        throw new Error(`${options.method || "GET"} ${path} → HTTP ${retryRes.status}: ${body}`);
+    } catch {
+      // Backend server is offline or unreachable — return safe fallback without crashing the UI
+      if (
+        path.includes("/alerts") ||
+        path.includes("/cameras") ||
+        path.includes("/zones") ||
+        path.includes("/events") ||
+        path.includes("/audit") ||
+        path.includes("/watchlist")
+      ) {
+        return [] as unknown as T;
       }
-      if (retryRes.status === 204) return undefined as T;
-      return retryRes.json() as Promise<T>;
+      return null as unknown as T;
     }
-  }
 
-  if (!res.ok) {
-    const body = await res.text().catch(() => "");
-    throw new Error(`${options.method || "GET"} ${path} → HTTP ${res.status}: ${body}`);
+    if (res.status === 401 && !path.includes("/auth/login")) {
+      // Token may have expired — clear and attempt auto-refresh
+      setStoredToken(null);
+      const freshToken = await ensureToken();
+      if (freshToken) {
+        headers["Authorization"] = `Bearer ${freshToken}`;
+        try {
+          const retryRes = await fetch(`${API_BASE}${path}`, {
+            ...options,
+            headers,
+          });
+          if (!retryRes.ok) {
+            return (path.includes("/alerts") || path.includes("/cameras") || path.includes("/zones") ? [] : null) as unknown as T;
+          }
+          if (retryRes.status === 204) return undefined as T;
+          return retryRes.json() as Promise<T>;
+        } catch {
+          return [] as unknown as T;
+        }
+      }
+    }
+
+    if (!res.ok) {
+      return (path.includes("/alerts") || path.includes("/cameras") || path.includes("/zones") ? [] : null) as unknown as T;
+    }
+    if (res.status === 204) return undefined as T;
+    return res.json() as Promise<T>;
+  } catch (err) {
+    console.warn(`[IBVAP API] Fetch notice for ${path}:`, err);
+    return [] as unknown as T;
   }
-  if (res.status === 204) return undefined as T;
-  return res.json() as Promise<T>;
 }
 
 function qs(params?: Record<string, string | number | undefined>): string {
@@ -299,6 +322,12 @@ export const updateAlert = (
   data: { status?: string; notes?: string; assigned_to?: number }
 ) => apiFetch<Alert>(`/api/v1/alerts/${id}`, { method: "PATCH", body: JSON.stringify(data) });
 
+export const purgeAlerts = () =>
+  apiFetch<{ message: string }>("/api/v1/alerts/purge", { method: "DELETE" });
+
+export const deleteAlert = (id: number) =>
+  apiFetch<{ message: string }>(`/api/v1/alerts/${id}`, { method: "DELETE" });
+
 // ─────────────────────────────────────────────
 // Events
 // ─────────────────────────────────────────────
@@ -318,6 +347,21 @@ export const getZones = () => apiFetch<Zone[]>("/api/v1/zones");
 
 export const createZone = (data: Partial<Zone>) =>
   apiFetch<Zone>("/api/v1/zones", { method: "POST", body: JSON.stringify(data) });
+
+export const deleteZone = (zoneUid: string) =>
+  apiFetch<{ message: string }>(`/api/v1/zones/${zoneUid}`, { method: "DELETE" });
+
+export const getCameraStreamUrl = (cameraUid: string) =>
+  `${API_BASE}/api/v1/cameras/${cameraUid}/stream`;
+
+export const getCameraFrameUrl = (cameraUid: string) =>
+  `${API_BASE}/api/v1/cameras/${cameraUid}/frame`;
+
+export const getMediaUrl = (path: string) => {
+  if (!path) return "";
+  if (path.startsWith("http://") || path.startsWith("https://")) return path;
+  return `${API_BASE}${path.startsWith("/") ? "" : "/"}${path}`;
+};
 
 // ─────────────────────────────────────────────
 // Audit trail

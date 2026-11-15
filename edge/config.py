@@ -31,14 +31,14 @@ class EdgeConfig:
     """Configuration for the edge inference pipeline."""
 
     # --- Camera / Ingestion ---
-    camera_source: str = os.getenv("CAMERA_SOURCE", "sample")
-    camera_fps: int = int(os.getenv("CAMERA_FPS", "15"))
+    camera_source: str = os.getenv("CAMERA_SOURCE", "auto")
+    camera_fps: int = int(os.getenv("CAMERA_FPS", "25"))
     frame_width: int = int(os.getenv("FRAME_WIDTH", "1280"))
     frame_height: int = int(os.getenv("FRAME_HEIGHT", "720"))
 
     # --- Detection ---
     yolo_model: str = os.getenv("YOLO_MODEL", "yolo11n.pt")
-    detection_confidence: float = float(os.getenv("DETECTION_CONFIDENCE", "0.4"))
+    detection_confidence: float = float(os.getenv("DETECTION_CONFIDENCE", "0.6"))
     detection_classes: list = field(default_factory=lambda: [0, 1, 2, 3, 5, 7])
     # COCO classes: 0=person, 1=bicycle, 2=car, 3=motorcycle, 5=bus, 7=truck
 
@@ -47,16 +47,16 @@ class EdgeConfig:
     track_buffer: int = int(os.getenv("TRACK_BUFFER", "30"))
 
     # --- Night Enhancement ---
-    night_enhance_enabled: bool = os.getenv("NIGHT_ENHANCE_ENABLED", "true").lower() == "true"
+    night_enhance_enabled: bool = os.getenv("NIGHT_ENHANCE_ENABLED", "false").lower() == "true"
     night_enhance_threshold: int = int(os.getenv("NIGHT_ENHANCE_THRESHOLD", "60"))
 
     # --- Face Detection ---
-    face_detection_enabled: bool = os.getenv("FACE_DETECTION_ENABLED", "true").lower() == "true"
+    face_detection_enabled: bool = os.getenv("FACE_DETECTION_ENABLED", "false").lower() == "true"
     face_model_pack: str = os.getenv("FACE_MODEL_PACK", "buffalo_l")
     face_det_size: tuple = (640, 640)
 
     # --- ANPR ---
-    anpr_enabled: bool = os.getenv("ANPR_ENABLED", "true").lower() == "true"
+    anpr_enabled: bool = os.getenv("ANPR_ENABLED", "false").lower() == "true"
     anpr_confidence: float = float(os.getenv("ANPR_CONFIDENCE", "0.5"))
     anpr_vote_frames: int = int(os.getenv("ANPR_VOTE_FRAMES", "5"))
 
@@ -65,7 +65,7 @@ class EdgeConfig:
     dwell_time_threshold: float = float(os.getenv("DWELL_TIME_THRESHOLD", "30.0"))  # seconds
 
     # --- Activity Detection ---
-    activity_detection_enabled: bool = os.getenv("ACTIVITY_DETECTION_ENABLED", "true").lower() == "true"
+    activity_detection_enabled: bool = os.getenv("ACTIVITY_DETECTION_ENABLED", "false").lower() == "true"
     loiter_threshold: float = float(os.getenv("LOITER_THRESHOLD", "60.0"))  # seconds
     sprint_speed_threshold: float = float(os.getenv("SPRINT_SPEED_THRESHOLD", "5.0"))  # m/s
     group_radius: float = float(os.getenv("GROUP_RADIUS", "3.0"))  # meters
@@ -88,14 +88,17 @@ class EdgeConfig:
 
     def get_camera_source(self) -> str | int:
         """Resolve camera source to a usable value."""
-        if self.camera_source == "sample":
-            # Use first sample video found
+        src = str(self.camera_source).strip().lower()
+        if src in ("auto", "webcam"):
+            return "auto"
+        elif src in ("usb", "external"):
+            return "usb"
+        elif src == "sample":
             if self.sample_videos_dir.exists():
                 videos = list(self.sample_videos_dir.glob("*.mp4"))
                 if videos:
                     return str(videos[0])
-            # Fallback to webcam
-            return 0
-        elif self.camera_source.isdigit():
-            return int(self.camera_source)
+            return "auto"
+        elif src.isdigit():
+            return int(src)
         return self.camera_source

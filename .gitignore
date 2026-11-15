@@ -79,14 +79,36 @@ edge/buffer/*.db
 ml/models/*
 !ml/models/.gitkeep
 
+# --- Dataset Storage & Raw Data ---
+ml/datasets/frames/
+ml/datasets/raw/
+ml/datasets/*.zip
+ml/datasets/*.tar.gz
+ml/datasets/*.tar
+ml/datasets/sample_videos/*
+!ml/datasets/sample_videos/.gitkeep
+!ml/datasets/sample_videos/sample_surveillance.mp4
+
 # --- Media & Surveillance Recordings ---
+core/media/*
+!core/media/.gitkeep
 core/media/clips/*
 !core/media/clips/.gitkeep
 core/media/thumbnails/*
 !core/media/thumbnails/.gitkeep
-ml/datasets/sample_videos/*
-!ml/datasets/sample_videos/.gitkeep
-!ml/datasets/sample_videos/sample_surveillance.mp4
+edge/media/*
+!edge/media/.gitkeep
+*.tmp.jpg
+*.tmp.webm
+*.tmp.mp4
+
+# --- Diagnostic & Scratch Output ---
+scratch/webcam_diag_frames/
+scratch/*.jpg
+scratch/*.jpeg
+scratch/*.png
+scratch/*.mp4
+scratch/*.webm
 
 # --- Node.js & Web Dashboard (Next.js) ---
 node_modules/
@@ -108,13 +130,15 @@ web/dashboard/out/
 next-env.d.ts
 .vercel/
 
-# Logs
-logs
+# Logs & Temporary Files
+logs/
 *.log
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 .pnpm-debug.log*
+*.tmp
+*.temp
 
 # --- Operating System & Editor Files ---
 .DS_Store
@@ -124,6 +148,7 @@ yarn-error.log*
 .Trashes
 ehthumbs.db
 Thumbs.db
+desktop.ini
 
 # IDEs & Editors
 .vscode/

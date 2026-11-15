@@ -137,7 +137,7 @@ class Tracker:
             return self._simulate_update(frame, frame_id, camera_id, timestamp)
 
         try:
-            # Run YOLO tracking with ByteTrack
+            # Run YOLO tracking with ByteTrack (optimized 384p inference for ultra-fluid 25+ FPS)
             results = self._model.track(
                 frame,
                 conf=self.confidence_threshold,
@@ -145,7 +145,7 @@ class Tracker:
                 tracker=self.tracker_config,
                 persist=True,
                 verbose=False,
-                imgsz=640,
+                imgsz=384,
             )
 
             current_track_ids = set()
@@ -156,11 +156,16 @@ class Tracker:
                     continue
 
                 boxes = result.boxes
-                for i in range(len(boxes)):
-                    track_id = int(boxes.id[i].cpu().numpy())
-                    bbox = boxes.xyxy[i].cpu().numpy().tolist()
-                    class_id = int(boxes.cls[i].cpu().numpy())
-                    confidence = float(boxes.conf[i].cpu().numpy())
+                ids = boxes.id.int().cpu().tolist()
+                xyxys = boxes.xyxy.cpu().tolist()
+                clss = boxes.cls.int().cpu().tolist()
+                confs = boxes.conf.cpu().tolist()
+
+                for i in range(len(ids)):
+                    track_id = int(ids[i])
+                    bbox = xyxys[i]
+                    class_id = int(clss[i])
+                    confidence = float(confs[i])
                     class_name = self._class_names.get(class_id, f"class_{class_id}")
 
                     # Ground point (bottom-center)

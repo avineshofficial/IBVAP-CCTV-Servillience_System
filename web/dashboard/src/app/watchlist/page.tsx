@@ -1,5 +1,5 @@
 "use client";
-import { useEffect, useState } from "react";
+import React, { useEffect, useState, useCallback } from "react";
 import { getWatchlist, addWatchlistEntry } from "@/lib/api";
 import type { WatchlistEntry } from "@/lib/api";
 
@@ -7,178 +7,254 @@ export default function WatchlistPage() {
   const [entries, setEntries] = useState<WatchlistEntry[]>([]);
   const [showAdd, setShowAdd] = useState(false);
   const [form, setForm] = useState({
-    entry_type: "plate",
+    entry_type: "face",
     reference_data: "",
     label: "",
     category: "suspect",
-    source_agency: "",
+    source_agency: "SSB-INTEL",
   });
 
-  useEffect(() => { loadWatchlist(); }, []);
+  const loadWatchlist = useCallback(async () => {
+    try {
+      const data = await getWatchlist();
+      setEntries(Array.isArray(data) ? data : []);
+    } catch (e) {
+      console.error("Watchlist load failed:", e);
+    }
+  }, []);
 
-  async function loadWatchlist() {
-    try { setEntries(await getWatchlist()); }
-    catch (e) { console.error(e); }
-  }
+  useEffect(() => {
+    let isSubscribed = true;
+    async function fetchWatchlist() {
+      try {
+        const data = await getWatchlist();
+        if (isSubscribed) {
+          setEntries(Array.isArray(data) ? data : []);
+        }
+      } catch (e) {
+        console.error("Watchlist load failed:", e);
+      }
+    }
+    fetchWatchlist();
+    return () => {
+      isSubscribed = false;
+    };
+  }, []);
 
   async function handleAdd(e: React.FormEvent) {
     e.preventDefault();
+    if (!form.label || !form.reference_data) return;
     try {
       await addWatchlistEntry(form);
       setShowAdd(false);
-      setForm({ entry_type: "plate", reference_data: "", label: "", category: "suspect", source_agency: "" });
-      loadWatchlist();
-    } catch (err) { console.error(err); }
+      setForm({
+        entry_type: "face",
+        reference_data: "",
+        label: "",
+        category: "suspect",
+        source_agency: "SSB-INTEL",
+      });
+      await loadWatchlist();
+    } catch (err) {
+      console.error("Add watchlist error:", err);
+    }
   }
 
+  const categoryBadges: Record<string, string> = {
+    suspect: "badge-critical",
+    poi: "badge-high",
+    bolo: "badge-medium",
+    high_threat: "badge-critical",
+  };
+
   return (
-    <div>
-      <div className="flex items-center justify-between mb-8">
+    <div className="space-y-4 max-w-[1600px] mx-auto">
+      {/* Tactical Watchlist Header */}
+      <div className="flex flex-wrap items-center justify-between gap-3 border-b border-[#162035] pb-3">
         <div>
-          <h1 className="text-2xl font-bold">👁 Watchlist Management</h1>
-          <p className="text-sm mt-1" style={{ color: "var(--text-secondary)" }}>
-            Face and plate watchlists · All queries are audit-logged
+          <div className="flex items-center gap-2.5">
+            <span className="w-2 h-2 rounded-full bg-cyan-400 shadow-[0_0_6px_#00e5ff]"></span>
+            <h1 className="text-sm font-bold uppercase tracking-widest text-slate-100 font-mono">
+              TARGET & THREAT WATCHLIST
+            </h1>
+            <span className="badge-status badge-online">
+              <span className="status-pip status-pip-online"></span> {entries.length} TARGETS LOADED
+            </span>
+          </div>
+          <p className="text-[11px] text-slate-400 font-mono mt-0.5">
+            Facial recognition embeddings & ANPR license plate registry · Automated real-time optical matching
           </p>
         </div>
-        <button className="btn btn-primary" onClick={() => setShowAdd(!showAdd)}>
-          {showAdd ? "✕ Cancel" : "+ Add Entry"}
+
+        <button
+          onClick={() => setShowAdd(!showAdd)}
+          className="btn-tactical-primary text-xs font-mono uppercase tracking-wider"
+        >
+          {showAdd ? "✕ Cancel" : "+ Register Target"}
         </button>
       </div>
 
-      {/* Add Form */}
+      {/* Add Target Drawer */}
       {showAdd && (
-        <div className="glass-card p-5 mb-6">
-          <h3 className="text-sm font-semibold mb-4">Add Watchlist Entry</h3>
-          <form onSubmit={handleAdd} className="grid grid-cols-1 md:grid-cols-2 gap-4">
+        <div className="tactical-panel p-4 space-y-3.5">
+          <div className="flex items-center justify-between border-b border-[#162035] pb-2.5">
+            <h2 className="text-xs font-bold uppercase tracking-wider text-slate-100 font-mono flex items-center gap-2">
+              <span className="text-cyan-400">🎯</span> Add New Watchlist Entry
+            </h2>
+            <span className="text-[10px] font-mono text-cyan-400 bg-cyan-950/60 px-1.5 py-0.5 rounded border border-cyan-800/40">
+              HMAC-SHA256 SECURED
+            </span>
+          </div>
+
+          <form onSubmit={handleAdd} className="grid grid-cols-1 md:grid-cols-2 gap-3.5 text-xs font-mono">
             <div>
-              <label className="text-xs mb-1 block" style={{ color: "var(--text-secondary)" }}>Type</label>
+              <label className="block text-slate-400 mb-1 text-[11px]">TARGET TYPE</label>
               <select
                 value={form.entry_type}
                 onChange={(e) => setForm({ ...form, entry_type: e.target.value })}
-                className="w-full p-2 rounded-lg text-sm"
-                style={{ background: "var(--bg-secondary)", border: "1px solid var(--border-subtle)", color: "var(--text-primary)" }}
+                className="w-full px-2.5 py-1.5 rounded-[3px] bg-[#070b16] border border-[#162035] text-white focus:border-cyan-400 outline-none text-xs cursor-pointer"
               >
-                <option value="plate">License Plate</option>
-                <option value="face">Face</option>
+                <option value="face">Facial Biometric Embedding</option>
+                <option value="plate">ANPR Vehicle License Plate</option>
               </select>
             </div>
+
             <div>
-              <label className="text-xs mb-1 block" style={{ color: "var(--text-secondary)" }}>Category</label>
+              <label className="block text-slate-400 mb-1 text-[11px]">TARGET LABEL / IDENTITY</label>
+              <input
+                type="text"
+                required
+                placeholder="e.g. Suspect Alpha or DL-1CAB-1234"
+                value={form.label}
+                onChange={(e) => setForm({ ...form, label: e.target.value })}
+                className="w-full px-2.5 py-1.5 rounded-[3px] bg-[#070b16] border border-[#162035] text-white focus:border-cyan-400 outline-none text-xs"
+              />
+            </div>
+
+            <div>
+              <label className="block text-slate-400 mb-1 text-[11px]">THREAT CATEGORY</label>
               <select
                 value={form.category}
                 onChange={(e) => setForm({ ...form, category: e.target.value })}
-                className="w-full p-2 rounded-lg text-sm"
-                style={{ background: "var(--bg-secondary)", border: "1px solid var(--border-subtle)", color: "var(--text-primary)" }}
+                className="w-full px-2.5 py-1.5 rounded-[3px] bg-[#070b16] border border-[#162035] text-white focus:border-cyan-400 outline-none text-xs cursor-pointer"
               >
-                <option value="wanted">Wanted</option>
-                <option value="suspect">Suspect</option>
-                <option value="vip">VIP</option>
-                <option value="stolen_vehicle">Stolen Vehicle</option>
+                <option value="suspect">Suspect / Fugitive</option>
+                <option value="poi">Person of Interest (POI)</option>
+                <option value="bolo">Be On the Lookout (BOLO)</option>
+                <option value="high_threat">High Priority Threat</option>
               </select>
             </div>
+
             <div>
-              <label className="text-xs mb-1 block" style={{ color: "var(--text-secondary)" }}>
-                {form.entry_type === "plate" ? "Plate Number" : "Reference ID"}
-              </label>
-              <input
-                type="text" required
-                placeholder={form.entry_type === "plate" ? "MH12AB1234" : "Face reference ID"}
-                value={form.reference_data}
-                onChange={(e) => setForm({ ...form, reference_data: e.target.value })}
-                className="w-full p-2 rounded-lg text-sm"
-                style={{ background: "var(--bg-secondary)", border: "1px solid var(--border-subtle)", color: "var(--text-primary)" }}
-              />
-            </div>
-            <div>
-              <label className="text-xs mb-1 block" style={{ color: "var(--text-secondary)" }}>Label</label>
+              <label className="block text-slate-400 mb-1 text-[11px]">SOURCE AGENCY / OUTPOST</label>
               <input
                 type="text"
-                placeholder="Description or name"
-                value={form.label}
-                onChange={(e) => setForm({ ...form, label: e.target.value })}
-                className="w-full p-2 rounded-lg text-sm"
-                style={{ background: "var(--bg-secondary)", border: "1px solid var(--border-subtle)", color: "var(--text-primary)" }}
-              />
-            </div>
-            <div>
-              <label className="text-xs mb-1 block" style={{ color: "var(--text-secondary)" }}>Source Agency</label>
-              <input
-                type="text"
-                placeholder="e.g., SSB, BSF, Police"
+                placeholder="e.g. SSB-HQ / MHA-INTEL"
                 value={form.source_agency}
                 onChange={(e) => setForm({ ...form, source_agency: e.target.value })}
-                className="w-full p-2 rounded-lg text-sm"
-                style={{ background: "var(--bg-secondary)", border: "1px solid var(--border-subtle)", color: "var(--text-primary)" }}
+                className="w-full px-2.5 py-1.5 rounded-[3px] bg-[#070b16] border border-[#162035] text-white focus:border-cyan-400 outline-none text-xs"
               />
             </div>
-            <div className="flex items-end">
-              <button type="submit" className="btn btn-primary w-full">Add to Watchlist</button>
+
+            <div className="md:col-span-2">
+              <label className="block text-slate-400 mb-1 text-[11px]">REFERENCE BIOMETRIC / PLATE STRING</label>
+              <input
+                type="text"
+                required
+                placeholder="License Plate string (e.g. UP32AB1234) or Biometric Vector ID"
+                value={form.reference_data}
+                onChange={(e) => setForm({ ...form, reference_data: e.target.value })}
+                className="w-full px-2.5 py-1.5 rounded-[3px] bg-[#070b16] border border-[#162035] text-white focus:border-cyan-400 outline-none font-mono text-xs"
+              />
+            </div>
+
+            <div className="md:col-span-2 flex justify-end gap-2.5 pt-1">
+              <button
+                type="button"
+                onClick={() => setShowAdd(false)}
+                className="btn-tactical-outline text-xs"
+              >
+                Cancel
+              </button>
+              <button type="submit" className="btn-tactical-primary text-xs">
+                Seal & Register to Watchlist
+              </button>
             </div>
           </form>
         </div>
       )}
 
-      {/* Watchlist Table */}
-      <div className="glass-card overflow-hidden">
+      {/* Target Registry Table */}
+      <div className="tactical-panel overflow-hidden">
+        <div className="p-3 border-b border-[#162035] flex items-center justify-between">
+          <div className="flex items-center gap-2">
+            <span className="w-1.5 h-1.5 rounded-full bg-cyan-400"></span>
+            <h2 className="text-xs font-bold uppercase tracking-wider font-mono text-slate-100">
+              Active Target Registry
+            </h2>
+          </div>
+          <span className="text-[10px] font-mono text-slate-400 font-mono-tabular">
+            TOTAL TARGETS: {entries.length}
+          </span>
+        </div>
+
         {entries.length === 0 ? (
-          <div className="p-12 text-center" style={{ color: "var(--text-secondary)" }}>
-            <p className="text-4xl mb-3">👁</p>
-            <p className="text-lg">Watchlist is empty</p>
-            <p className="text-sm mt-1">Add face or plate entries to monitor</p>
+          <div className="p-14 text-center text-slate-400 space-y-2.5">
+            <div className="w-10 h-10 rounded-[4px] bg-[#090e1b] border border-[#162035] flex items-center justify-center mx-auto text-cyan-400">
+              <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <circle cx="12" cy="12" r="7" strokeDasharray="3 3" />
+                <circle cx="12" cy="12" r="2" fill="#00e5ff" />
+              </svg>
+            </div>
+            <p className="text-sm font-bold text-slate-100 font-mono uppercase tracking-wider">
+              No Watchlist Targets Configured
+            </p>
+            <p className="text-[11px] text-slate-400 max-w-sm mx-auto font-mono leading-relaxed">
+              Register wanted persons or suspicious vehicle plates above. The edge AI engine compares detected faces and vehicles against this registry in real time.
+            </p>
           </div>
         ) : (
-          <table className="data-table">
-            <thead>
-              <tr>
-                <th>ID</th>
-                <th>Type</th>
-                <th>Label</th>
-                <th>Category</th>
-                <th>Source</th>
-                <th>Hash (Stored)</th>
-                <th>Status</th>
-              </tr>
-            </thead>
-            <tbody>
-              {entries.map((entry) => (
-                <tr key={entry.id}>
-                  <td className="font-mono text-xs">#{entry.id}</td>
-                  <td>
-                    <span className={`badge ${entry.entry_type === "face" ? "badge-high" : "badge-medium"}`}>
-                      {entry.entry_type === "face" ? "👤 Face" : "🔢 Plate"}
-                    </span>
-                  </td>
-                  <td className="text-sm">{entry.label || "—"}</td>
-                  <td>
-                    <span className="text-xs px-2 py-1 rounded" style={{
-                      background: entry.category === "wanted" ? "rgba(239,68,68,0.15)" :
-                        entry.category === "vip" ? "rgba(139,92,246,0.15)" : "rgba(245,158,11,0.15)",
-                      color: entry.category === "wanted" ? "var(--accent-red)" :
-                        entry.category === "vip" ? "var(--accent-purple)" : "var(--accent-amber)",
-                    }}>
-                      {entry.category || "—"}
-                    </span>
-                  </td>
-                  <td className="text-xs">{entry.source_agency || "—"}</td>
-                  <td className="font-mono text-xs" style={{ color: "var(--accent-cyan)" }}>
-                    {entry.reference_hash.slice(0, 24)}...
-                  </td>
-                  <td>
-                    <span className={`status-dot ${entry.is_active ? "status-online" : "status-offline"}`}></span>
-                  </td>
+          <div className="overflow-x-auto">
+            <table className="w-full text-left text-xs font-mono">
+              <thead className="bg-[#070b16] text-slate-400 border-b border-[#162035] uppercase text-[10px] tracking-wider">
+                <tr>
+                  <th className="py-2.5 px-3.5">TARGET UID</th>
+                  <th className="py-2.5 px-3.5">MODALITY</th>
+                  <th className="py-2.5 px-3.5">TARGET IDENTITY</th>
+                  <th className="py-2.5 px-3.5">THREAT CATEGORY</th>
+                  <th className="py-2.5 px-3.5">INTELLIGENCE AGENCY</th>
+                  <th className="py-2.5 px-3.5 text-right">DATE REGISTERED</th>
                 </tr>
-              ))}
-            </tbody>
-          </table>
+              </thead>
+              <tbody className="divide-y divide-[#162035]">
+                {entries.map((item) => (
+                  <tr key={item.id} className="hover:bg-[#0c1324] transition-colors">
+                    <td className="py-2.5 px-3.5 font-bold text-cyan-400 font-mono-tabular">
+                      #{item.id}
+                    </td>
+                    <td className="py-2.5 px-3.5 uppercase text-slate-300 font-semibold text-[11px]">
+                      {item.entry_type === "face" ? "👤 BIOMETRIC FACE" : "🚗 ANPR PLATE"}
+                    </td>
+                    <td className="py-2.5 px-3.5 font-bold text-white">
+                      {item.label}
+                    </td>
+                    <td className="py-2.5 px-3.5">
+                      <span className={`badge-status ${categoryBadges[item.category || "suspect"] || "badge-medium"}`}>
+                        {(item.category || "suspect").replace("_", " ")}
+                      </span>
+                    </td>
+                    <td className="py-2.5 px-3.5 text-slate-400">
+                      {item.source_agency || "SSB-INTEL"}
+                    </td>
+                    <td className="py-2.5 px-3.5 text-right text-slate-400 font-mono-tabular">
+                      {item.added_at ? new Date(item.added_at).toLocaleDateString("en-GB") : "—"}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
         )}
-      </div>
-
-      {/* Privacy Notice */}
-      <div className="mt-6 p-4 rounded-lg" style={{ background: "rgba(59,130,246,0.1)", border: "1px solid rgba(59,130,246,0.2)" }}>
-        <p className="text-xs" style={{ color: "var(--accent-blue)" }}>
-          🔒 <strong>DPDP Act Compliance:</strong> Plate numbers are stored as salted HMAC-SHA256 hashes, never in plaintext.
-          All watchlist queries are audit-logged. Face embeddings are stored as encrypted vectors.
-        </p>
       </div>
     </div>
   );
