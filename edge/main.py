@@ -60,6 +60,11 @@ class EdgePipeline:
         # while ensuring EVERY person who breaches triggers an alert independently
         self._track_alert_cooldown: dict[int, float] = {}
 
+        # Background CPU ThreadPoolExecutor for asynchronous non-blocking I/O
+        # (clip encoding, disk thumbnail writing, live frame streaming, and core uplink sync)
+        from concurrent.futures import ThreadPoolExecutor
+        self._io_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="ibvap_cpu_io")
+
         # Statistics
         self._stats = {
             "frames_processed": 0,
@@ -87,12 +92,15 @@ class EdgePipeline:
             height=self.config.frame_height,
         )
 
-        # Tracker (includes detection)
+        # Tracker (YOLO26 detection + ByteTrack with RTX 3050 CUDA / FP16 acceleration)
         self.tracker = Tracker(
-            model_name=self.config.yolo_model,
+            model_name=self.config.get_yolo_model_path(),
             tracker_config=self.config.tracker_type,
             confidence_threshold=self.config.detection_confidence,
             target_classes=self.config.detection_classes,
+            device=self.config.get_yolo_device(),
+            half=self.config.is_half_precision(),
+            imgsz=self.config.yolo_imgsz,
         )
 
         # Virtual Fence
@@ -136,12 +144,13 @@ class EdgePipeline:
         return self._night_enhancer
 
     def _get_face_detector(self):
-        """Lazy-load face detection module."""
+        """Lazy-load face detection module with GPU acceleration."""
         if self._face_detector is None and self.config.face_detection_enabled:
             try:
                 from edge.inference.face import FaceDetector
                 self._face_detector = FaceDetector(
                     model_pack=self.config.face_model_pack,
+                    device=self.config.get_yolo_device(),
                 )
                 logger.info("Face detector loaded")
             except Exception as e:
@@ -149,13 +158,14 @@ class EdgePipeline:
         return self._face_detector
 
     def _get_anpr_engine(self):
-        """Lazy-load ANPR module."""
+        """Lazy-load ANPR module with GPU acceleration."""
         if self._anpr_engine is None and self.config.anpr_enabled:
             try:
                 from edge.inference.anpr import ANPREngine
                 self._anpr_engine = ANPREngine(
                     confidence=self.config.anpr_confidence,
                     vote_frames=self.config.anpr_vote_frames,
+                    device=self.config.get_yolo_device(),
                 )
                 logger.info("ANPR engine loaded")
             except Exception as e:
@@ -163,7 +173,7 @@ class EdgePipeline:
         return self._anpr_engine
 
     def _get_activity_detector(self):
-        """Lazy-load activity detection."""
+        """Lazy-load activity detection (CPU ML with n_jobs=1 for real-time inference without contention)."""
         if self._activity_detector is None and self.config.activity_detection_enabled:
             try:
                 from edge.inference.activity import ActivityDetector
@@ -172,8 +182,9 @@ class EdgePipeline:
                     sprint_speed_threshold=self.config.sprint_speed_threshold,
                     group_radius=self.config.group_radius,
                     group_min_count=self.config.group_min_count,
+                    n_jobs=1,
                 )
-                logger.info("Activity detector loaded")
+                logger.info("Activity detector loaded (CPU Random Forest + Rules)")
             except Exception as e:
                 logger.warning(f"Activity detector unavailable: {e}")
         return self._activity_detector
@@ -249,10 +260,16 @@ class EdgePipeline:
         base_url = self.config.core_api_url.rstrip("/")
         try:
             headers = {"X-Edge-API-Key": self.config.edge_api_key}
-            resp = httpx.get(f"{base_url}/api/v1/zones", headers=headers, timeout=3.0)
+            resp = httpx.get(f"{base_url}/api/v1/zones", headers=headers, timeout=2.0)
             if resp.status_code == 200:
+                self._core_reachable = True
                 core_zones = resp.json()
                 for z in core_zones:
+                    # Ignore legacy screen-splitting line-cross zone
+                    if z.get("zone_uid") == "zone_border_line":
+                        continue
+                    if not z.get("is_active", True):
+                        continue
                     if z.get("camera_uid") == self.camera.camera_id or not z.get("camera_uid"):
                         rule_str = z.get("rule_type", "exclusion")
                         try:
@@ -261,7 +278,7 @@ class EdgePipeline:
                             rule_type = FenceRuleType.EXCLUSION
                         
                         pts = [tuple(p) for p in z.get("polygon_points_pixel", [])]
-                        if len(pts) >= 2:
+                        if len(pts) >= 3:
                             fz = FenceZone(
                                 zone_id=z["zone_uid"],
                                 name=z["name"],
@@ -274,7 +291,7 @@ class EdgePipeline:
                             )
                             self.fence_engine.add_zone(fz)
         except Exception:
-            pass
+            self._core_reachable = False
 
     def _start_incident_clip_recording(self, camera_id: str, track_id: int) -> str:
         """
@@ -345,23 +362,49 @@ class EdgePipeline:
                     writer.write(f)
                 writer.release()
                 logger.info(
-                    f"[EVIDENCE CAPTURE COMPLETE] Saved 7.5s WebM clip: {webm_path.name} "
+                    f"[EVIDENCE CAPTURE COMPLETE] Saved 7.5s WebM clip on CPU I/O worker: {webm_path.name} "
                     f"({num_frames} frames @ {fps} FPS = {num_frames/fps:.1f}s playback)"
                 )
             except Exception as e:
                 logger.warning(f"Failed to encode incident clip: {e}")
 
-        import threading
-        threading.Thread(target=_encode_worker, daemon=True).start()
+        # Offload encoding to background CPU ThreadPoolExecutor so GPU loop never pauses
+        self._io_executor.submit(_encode_worker)
 
     def _save_thumbnail(self, frame, track_id: int, frame_id: int) -> str:
-        """Save a detection thumbnail to disk."""
+        """Save a detection thumbnail to disk asynchronously via ThreadPoolExecutor."""
         thumb_dir = self.config.media_dir / "thumbnails"
         thumb_dir.mkdir(parents=True, exist_ok=True)
         filename = f"thumb_{frame_id}_{track_id}.jpg"
         path = thumb_dir / filename
-        cv2.imwrite(str(path), frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+        frame_copy = frame.copy()
+
+        def _write():
+            try:
+                cv2.imwrite(str(path), frame_copy, [cv2.IMWRITE_JPEG_QUALITY, 80])
+            except Exception as e:
+                logger.debug(f"Thumbnail write error: {e}")
+
+        self._io_executor.submit(_write)
         return str(path)
+
+    def _write_live_frame_async(self, jpeg_buf, camera_id: str):
+        """Asynchronously write live stream frame to disk on CPU executor."""
+        try:
+            live_path = self.config.media_dir / f"live_{camera_id}.jpg"
+            tmp_path = self.config.media_dir / f"live_{camera_id}.tmp.jpg"
+            with open(tmp_path, "wb") as f:
+                f.write(jpeg_buf)
+            os.replace(tmp_path, live_path)
+        except Exception:
+            pass
+
+    def _sync_alerts_async(self):
+        """Asynchronously trigger uplink sync batch to Core API on CPU executor."""
+        try:
+            self.sync_agent.sync_batch_sync(self.local_store)
+        except Exception as e:
+            logger.debug(f"Async alert sync error: {e}")
 
     def _draw_overlays(self, frame, tracks, fence_zones, breaches):
         """Draw modern high-precision surveillance overlays with breach alerts.
@@ -370,162 +413,94 @@ class EdgePipeline:
         overlay = frame  # Draw directly on frame — no copy (caller handles copy if needed)
         h, w = overlay.shape[:2]
 
-        breached_track_ids = {b.track_id: b for b in breaches}
-        has_active_breach = len(breaches) > 0 or (time.time() < self._active_breach_until)
-        if time.time() < self._active_breach_until:
-            for tid in self._breached_track_ids:
-                breached_track_ids[tid] = True
+        # Identify active exclusion zones (floor restricted polygons)
+        exclusion_zones = [z for z in fence_zones if z.rule_type.value == "exclusion" and z.is_active and len(z.polygon_points_pixel) >= 3]
 
-        # Real-time check: mark EVERY track whose position is inside the restricted area or touching the line
-        # This runs every frame independently of cooldowns so ALL persons who breach are shown in RED
-        exclusion_zones = [z for z in fence_zones if z.rule_type.value == "exclusion" and z.is_active]
-        line_zones = [z for z in fence_zones if z.rule_type.value == "line_cross" and z.is_active]
-
+        # Real-time check: evaluate EVERY track's ground-contact point (bottom-center of bbox)
+        # against the calibrated perspective restricted floor polygon
+        breached_track_ids = set()
         for track in tracks:
-            if track.track_id in breached_track_ids:
-                continue  # Already marked
-
-            gp = track.ground_point
             bx1, by1, bx2, by2 = [int(c) for c in track.bbox] if track.bbox and len(track.bbox) == 4 else (0, 0, 0, 0)
-            center = ((bx1 + bx2) / 2.0, (by1 + by2) / 2.0)
             bottom_center = ((bx1 + bx2) / 2.0, float(by2))
 
             is_intruder = False
-
-            # Check exclusion polygons (restricted alert area)
             for ez in exclusion_zones:
-                poly = ez.polygon_points_pixel
-                if (self.fence_engine._point_in_polygon(gp, poly) or
-                    self.fence_engine._point_in_polygon(center, poly) or
-                    self.fence_engine._point_in_polygon(bottom_center, poly) or
-                    self.fence_engine._point_in_polygon((float(bx1), float(by2)), poly) or
-                    self.fence_engine._point_in_polygon((float(bx2), float(by2)), poly)):
+                contour = np.array([(int(p[0]), int(p[1])) for p in ez.polygon_points_pixel], dtype=np.int32)
+                # Point-in-polygon test: >= 0 means on edge or inside the restricted floor polygon
+                if cv2.pointPolygonTest(contour, bottom_center, False) >= 0:
                     is_intruder = True
                     break
 
-            # Check border line (if touching line, or on restricted side below line)
-            if not is_intruder:
-                for lz in line_zones:
-                    lpts = lz.polygon_points_pixel
-                    if len(lpts) == 2:
-                        lx1, ly1 = lpts[0]
-                        lx2, ly2 = lpts[1]
-                        line_y = (ly1 + ly2) / 2.0
-                        min_x, max_x = min(lx1, lx2), max(lx1, lx2)
-                        # Does bounding box touch or cross the border line?
-                        touches = (by1 - 10 <= line_y <= by2 + 10) and (bx2 >= min_x and bx1 <= max_x)
-                        # Is ground point or body bottom on the restricted side below the border line?
-                        below_line = (gp[1] >= line_y or by2 >= line_y) and (bx2 >= min_x and bx1 <= max_x)
-                        if touches or below_line:
-                            is_intruder = True
-                            break
-
             if is_intruder:
-                breached_track_ids[track.track_id] = True
-                self._breached_track_ids.add(track.track_id)
-                has_active_breach = True
+                breached_track_ids.add(track.track_id)
+
+        # Update persistent set and determine active breach state
+        self._breached_track_ids = set(breached_track_ids)
+        has_active_breach = len(breached_track_ids) > 0
 
         # ──────────────────────────────────────────────────────────
-        # 1. Draw Virtual Fence Zones & Border Lines
+        # 1. Draw Virtual Fence Zones (Perspective Ground-Attached)
         # ──────────────────────────────────────────────────────────
         for zone in fence_zones:
             pts = np.array([(int(p[0]), int(p[1])) for p in zone.polygon_points_pixel], np.int32)
-            if len(pts) < 2:
-                continue
+            if len(pts) < 3:
+                continue  # Need at least 3 points for a polygon
 
-            zone_breached = any(b.zone_id == zone.zone_id for b in breaches) or (has_active_breach and ("restricted" in zone.zone_id or zone.rule_type.value == "exclusion"))
-            
-            if zone.rule_type.value == "line_cross":
-                # ── Solid Red Border Line (clear divider between SAFE and RESTRICTED) ──
-                pulse = int(time.time() * 4) % 2 == 0
-                line_color = (255, 255, 255) if (zone_breached and pulse) else (0, 0, 255)
-                # Solid visible line: 3px normal, 4px when breached
-                line_th = 4 if zone_breached else 3
+            zone_breached = any(b.zone_id == zone.zone_id for b in breaches) or (has_active_breach and (zone.zone_id == "zone_restricted_area" or zone.rule_type.value == "exclusion"))
 
-                if len(pts) == 2:
-                    p1, p2 = tuple(pts[0]), tuple(pts[1])
-                    # Primary solid red line
-                    cv2.line(overlay, p1, p2, line_color, line_th, cv2.LINE_AA)
+            if zone.rule_type.value == "exclusion":
+                # ── PERSPECTIVE GROUND-ATTACHED RESTRICTED ZONE ──
+                # Subtle transparent red shadow on the floor polygon with soft feathered edges
 
-                    # Subtle endpoint markers
-                    cv2.circle(overlay, p1, 4, (0, 0, 255), -1)
-                    cv2.circle(overlay, p2, 4, (0, 0, 255), -1)
+                # Create a mask for the polygon shape
+                mask = np.zeros((h, w), dtype=np.uint8)
+                cv2.fillPoly(mask, [pts], 255)
 
-                    # Centered "-- RESTRICTED BORDER LINE --" label
-                    mid_x = (p1[0] + p2[0]) // 2
-                    mid_y = (p1[1] + p2[1]) // 2
-                    status_txt = "RESTRICTED BORDER LINE // TOUCH BREACH" if zone_breached else "RESTRICTED BORDER LINE"
-                    tag_color = (0, 0, 255) if zone_breached else (0, 220, 255)
-                    # Get text size for centering
-                    label = f"-- {status_txt} --"
-                    (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.42, 1)
-                    text_x = mid_x - tw // 2
-                    text_y = max(16, mid_y - 8)
-                    # Dark background behind text for readability
-                    cv2.rectangle(overlay, (text_x - 4, text_y - th - 4), (text_x + tw + 4, text_y + 4), (0, 0, 0), -1)
-                    cv2.putText(
-                        overlay,
-                        label,
-                        (text_x, text_y),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.42,
-                        tag_color,
-                        1,
-                        cv2.LINE_AA,
-                    )
-                else:
-                    cv2.polylines(overlay, [pts], True, line_color, line_th, cv2.LINE_AA)
+                # Apply Gaussian blur for soft feathered edges
+                mask_soft = cv2.GaussianBlur(mask, (31, 31), 15)
 
-            elif zone.rule_type.value == "exclusion":
-                # ── RESTRICTED RED AREA — performance optimized ──
-                # Use ROI-bounded blending instead of full-frame copy
+                # Normalize mask to 0.0 - 1.0 range
+                mask_float = mask_soft.astype(np.float32) / 255.0
+
+                # Determine zone color and intensity based on breach state
                 if zone_breached:
-                    pulse = int(time.time() * 4) % 2 == 0
-                    fill_color = (0, 0, 230) if pulse else (0, 30, 200)
-                    opacity = 0.35
-                    border_color = (0, 0, 255)
-                    border_th = 3
-                else:
-                    fill_color = (0, 0, 180)
-                    opacity = 0.28
-                    border_color = (0, 0, 200)
+                    pulse = int(time.time() * 3) % 2 == 0
+                    # Subtle red tint: slightly more visible when breached
+                    red_intensity = 0.18 if pulse else 0.14
+                    border_color = (0, 0, 255)  # Bright red border
                     border_th = 2
+                else:
+                    red_intensity = 0.10  # Very subtle 10% red shadow (floor texture preserved)
+                    border_color = (0, 0, 180)  # Muted red border
+                    border_th = 1
 
-                # Compute bounding rect of the polygon for ROI-only blending
+                # Create the red tint overlay using the soft mask
+                # Only apply to the masked region (ROI-bounded for performance)
                 bx, by, bw, bh = cv2.boundingRect(pts)
-                bx2, by2 = min(bx + bw, w), min(by + bh, h)
+                bx2r, by2r = min(bx + bw, w), min(by + bh, h)
                 bx, by = max(bx, 0), max(by, 0)
                 if bw > 0 and bh > 0:
-                    roi = overlay[by:by2, bx:bx2].copy()
-                    # Shift polygon points to ROI-local coords
-                    local_pts = pts - np.array([bx, by])
-                    sub_roi = roi.copy()
-                    cv2.fillPoly(sub_roi, [local_pts], fill_color)
-                    cv2.addWeighted(sub_roi, opacity, roi, 1.0 - opacity, 0, roi)
-                    overlay[by:by2, bx:bx2] = roi
+                    roi = overlay[by:by2r, bx:bx2r]
+                    mask_roi = mask_float[by:by2r, bx:bx2r]
 
-                # Border edge
+                    # Create a red-tinted version of the ROI
+                    red_layer = roi.copy()
+                    red_layer[:, :, 2] = np.clip(red_layer[:, :, 2].astype(np.float32) + 60, 0, 255).astype(np.uint8)  # Boost red channel
+                    red_layer[:, :, 1] = (red_layer[:, :, 1].astype(np.float32) * 0.85).astype(np.uint8)  # Slightly reduce green
+                    red_layer[:, :, 0] = (red_layer[:, :, 0].astype(np.float32) * 0.85).astype(np.uint8)  # Slightly reduce blue
+
+                    # Blend using the soft mask
+                    mask_3ch = np.stack([mask_roi, mask_roi, mask_roi], axis=2)
+                    blended = (roi.astype(np.float32) * (1.0 - mask_3ch * red_intensity) +
+                               red_layer.astype(np.float32) * (mask_3ch * red_intensity))
+                    overlay[by:by2r, bx:bx2r] = np.clip(blended, 0, 255).astype(np.uint8)
+
+                # Draw thin perspective boundary polyline (the "floor perimeter")
                 cv2.polylines(overlay, [pts], True, border_color, border_th, cv2.LINE_AA)
 
-                # ── Warning Triangle Icon ──
-                try:
-                    cx = int(sum(p[0] for p in pts) / len(pts))
-                    cy = int(sum(p[1] for p in pts) / len(pts))
-
-                    tri_h, tri_w = 40, 44
-                    tri_pts = np.array([
-                        (cx, cy - tri_h // 2),
-                        (cx - tri_w // 2, cy + tri_h // 2),
-                        (cx + tri_w // 2, cy + tri_h // 2),
-                    ], np.int32)
-
-                    cv2.fillPoly(overlay, [tri_pts], (0, 0, 200))
-                    cv2.polylines(overlay, [tri_pts], True, (255, 255, 255), 2, cv2.LINE_AA)
-                    cv2.line(overlay, (cx, cy - tri_h // 2 + 12), (cx, cy + tri_h // 2 - 14), (255, 255, 255), 3, cv2.LINE_AA)
-                    cv2.circle(overlay, (cx, cy + tri_h // 2 - 8), 3, (255, 255, 255), -1, cv2.LINE_AA)
-                except Exception:
-                    pass
-
+                # Small corner markers at each polygon vertex (subtle ground anchors)
+                for pt in pts:
+                    cv2.circle(overlay, tuple(pt), 3, border_color, -1, cv2.LINE_AA)
 
             elif zone.rule_type.value == "dwell":
                 # Dwell Monitoring Zone
@@ -640,16 +615,12 @@ class EdgePipeline:
         # Pull any existing custom zones from core
         self._pull_zones_from_core()
 
-        # Initialize border line + restricted area if not present
-        if not self.fence_engine.get_zones():
-            self.fence_engine.create_restricted_border_zone(
-                self.config.frame_width, self.config.frame_height, self.camera.camera_id
-            )
-
-        # Always ensure the restricted AREA polygon exists below the border line
-        # (create_restricted_area_zone internally checks for duplicates)
-        self.fence_engine.create_restricted_area_zone(
-            self.config.frame_width, self.config.frame_height, self.camera.camera_id
+        # Always initialize/refresh the calibrated perspective restricted zone from config
+        self.fence_engine.create_perspective_restricted_zone(
+            polygon_points=self.config.restricted_zone_polygon,
+            camera_id=self.camera.camera_id,
+            frame_width=self.config.frame_width,
+            frame_height=self.config.frame_height,
         )
 
 
@@ -664,20 +635,26 @@ class EdgePipeline:
                 time.sleep(float(self.config.sync_interval))
                 try:
                     self._pull_zones_from_core()
-                    asyncio.run(self.sync_agent.sync_batch(self.local_store))
+                    self.sync_agent.sync_batch_sync(self.local_store)
                 except Exception:
                     pass
         import threading
         t_sync = threading.Thread(target=_bg_sync, daemon=True)
         t_sync.start()
 
-        logger.info("=" * 60)
-        logger.info("IBVAP Edge Pipeline — Running")
-        logger.info(f"  Source: {self.config.get_camera_source()}")
-        logger.info(f"  Target FPS: {self.config.camera_fps}")
-        logger.info(f"  Detection confidence: {self.config.detection_confidence}")
+        # Determine active execution device string
+        active_device = self.config.get_device_description()
+
+        logger.info("=" * 65)
+        logger.info("IBVAP Edge Pipeline — Running (Hybrid CPU + GPU Architecture)")
+        logger.info(f"  Active Execution Device: {active_device}")
+        logger.info(f"  Inference Engine: YOLO26n ({self.config.yolo_model})")
+        logger.info(f"  GPU Vision Workloads: YOLO26 Detection ({'FP16' if self.config.is_half_precision() else 'FP32'}), Gated Face/ANPR ROIs")
+        logger.info(f"  CPU Workloads: Video Grabber, ByteTrack, Virtual Fence, Random Forest Activity (n_jobs=1), Async I/O")
+        logger.info(f"  Camera Source: {self.config.get_camera_source()}")
+        logger.info(f"  Target FPS: {self.config.camera_fps} | Resolution: {self.config.frame_width}x{self.config.frame_height}")
         logger.info(f"  Show display: {show_display}")
-        logger.info("=" * 60)
+        logger.info("=" * 65)
 
         try:
             for packet in self.camera.frames():
@@ -691,13 +668,13 @@ class EdgePipeline:
                 frame = packet.frame
                 self._frame_count += 1
 
-                # --- Night Enhancement ---
+                # --- Night Enhancement (CPU CLAHE/Gamma only when luminance drops) ---
                 enhanced = False
                 night_enhancer = self._get_night_enhancer()
                 if night_enhancer:
                     frame, enhanced = night_enhancer.enhance_if_needed(frame)
 
-                # --- Detection + Tracking ---
+                # --- Detection + Tracking (GPU YOLO26 FP16 + CPU ByteTrack) ---
                 tracks = self.tracker.update(
                     frame,
                     frame_id=packet.frame_id,
@@ -705,7 +682,7 @@ class EdgePipeline:
                     timestamp=packet.timestamp,
                 )
 
-                # --- Virtual Fence Evaluation ---
+                # --- Virtual Fence Evaluation (CPU Geometry) ---
                 all_breaches = []
                 for track in tracks:
                     breaches = self.fence_engine.evaluate(
@@ -720,37 +697,45 @@ class EdgePipeline:
                     )
                     all_breaches.extend(breaches)
 
-                # --- Face Detection (on person crops) ---
+                # --- Face Detection (Gated execution on cropped person ROIs) ---
                 face_detector = self._get_face_detector()
                 face_results = []
                 if face_detector:
-                    person_tracks = [t for t in tracks if t.class_name == "person"]
+                    person_tracks = [t for t in tracks if t.class_name == "person" and t.is_active]
                     for track in person_tracks[:3]:  # Limit to 3 persons per frame
-                        x1, y1, x2, y2 = [int(c) for c in track.bbox]
-                        h, w = frame.shape[:2]
-                        crop = frame[max(0, y1):min(h, y2), max(0, x1):min(w, x2)]
-                        if crop.size > 0:
-                            faces = face_detector.detect(crop, track.track_id)
-                            face_results.extend(faces)
+                        is_breached_target = track.track_id in self._breached_track_ids
+                        # Gate execution: run on breach (immediate), new track (frame 1), or sampled every 15 frames
+                        should_run_face = is_breached_target or (track.frame_count == 1) or (track.frame_count % 15 == 0)
+                        if should_run_face:
+                            x1, y1, x2, y2 = [int(c) for c in track.bbox]
+                            h, w = frame.shape[:2]
+                            crop = frame[max(0, y1):min(h, y2), max(0, x1):min(w, x2)]
+                            if crop.size > 0:
+                                faces = face_detector.detect(crop, track.track_id)
+                                face_results.extend(faces)
 
-                # --- ANPR (on vehicle crops) ---
+                # --- ANPR (Gated execution on cropped vehicle ROIs) ---
                 anpr_engine = self._get_anpr_engine()
                 plate_results = []
                 if anpr_engine:
                     vehicle_tracks = [
                         t for t in tracks
-                        if t.class_name in ("car", "truck", "bus", "motorcycle")
+                        if t.class_name in ("car", "truck", "bus", "motorcycle") and t.is_active
                     ]
                     for track in vehicle_tracks[:3]:
-                        x1, y1, x2, y2 = [int(c) for c in track.bbox]
-                        h, w = frame.shape[:2]
-                        crop = frame[max(0, y1):min(h, y2), max(0, x1):min(w, x2)]
-                        if crop.size > 0:
-                            plate = anpr_engine.read_plate(crop, track.track_id)
-                            if plate:
-                                plate_results.append(plate)
+                        is_breached_target = track.track_id in self._breached_track_ids
+                        # Gate execution: run on breach (immediate), new track (frame 1), or sampled every 15 frames
+                        should_run_anpr = is_breached_target or (track.frame_count == 1) or (track.frame_count % 15 == 0)
+                        if should_run_anpr:
+                            x1, y1, x2, y2 = [int(c) for c in track.bbox]
+                            h, w = frame.shape[:2]
+                            crop = frame[max(0, y1):min(h, y2), max(0, x1):min(w, x2)]
+                            if crop.size > 0:
+                                plate = anpr_engine.read_plate(crop, track.track_id)
+                                if plate:
+                                    plate_results.append(plate)
 
-                # --- Activity Detection ---
+                # --- Activity Detection (CPU Random Forest ML + Rules, n_jobs=1) ---
                 activity_detector = self._get_activity_detector()
                 activities = []
                 if activity_detector:
@@ -786,7 +771,7 @@ class EdgePipeline:
                 if self._frame_count % 3 == 0:
                     self._frame_buffer.append((time.time(), overlay.copy()))
 
-                # Feed active incident recorders
+                # Feed active incident recorders (encoded asynchronously in CPU ThreadPoolExecutor)
                 if self._active_recorders:
                     frame_copy = overlay.copy()  # Single copy shared across all recorders
                     still_active = []
@@ -798,16 +783,12 @@ class EdgePipeline:
                             still_active.append(rec)
                     self._active_recorders = still_active
 
-                # Save live frame for real-time frontend streaming (throttled to ~5 FPS to reduce disk IO)
+                # Save live frame for real-time frontend streaming (non-blocking CPU worker thread)
                 if self._frame_count % 3 == 0:
                     try:
                         ret, jpeg_buf = cv2.imencode(".jpg", overlay, [cv2.IMWRITE_JPEG_QUALITY, 70])
                         if ret:
-                            live_path = self.config.media_dir / f"live_{packet.camera_id}.jpg"
-                            tmp_path = self.config.media_dir / f"live_{packet.camera_id}.tmp.jpg"
-                            with open(tmp_path, "wb") as f:
-                                f.write(jpeg_buf)
-                            os.replace(tmp_path, live_path)
+                            self._io_executor.submit(self._write_live_frame_async, jpeg_buf, packet.camera_id)
                     except Exception:
                         pass
 
@@ -867,12 +848,8 @@ class EdgePipeline:
                             new_alerts_created = True
 
                     if new_alerts_created:
-                        # Instantly push to core so the dashboard receives the alert signals for all breached persons
-                        import threading
-                        threading.Thread(
-                            target=lambda: asyncio.run(self.sync_agent.sync_batch(self.local_store)),
-                            daemon=True
-                        ).start()
+                        # Offload to CPU ThreadPoolExecutor so GPU detection loop never pauses on network I/O
+                        self._io_executor.submit(self._sync_alerts_async)
                 elif now_breach > self._active_breach_until:
                     self._breached_track_ids.clear()
 
@@ -924,11 +901,17 @@ class EdgePipeline:
         logger.info("Shutting down edge pipeline...")
 
         self.camera.release()
-        try:
-            # Sync remaining events to Core API
-            asyncio.run(self.sync_agent.sync_batch(self.local_store))
-        except Exception as e:
-            logger.debug(f"Final sync failed: {e}")
+        if hasattr(self, "_io_executor"):
+            try:
+                self._io_executor.shutdown(wait=False, cancel_futures=True)
+            except Exception:
+                pass
+        if getattr(self, "_core_reachable", False):
+            try:
+                # Sync remaining events to Core API if core was online
+                asyncio.run(self.sync_agent.sync_batch(self.local_store))
+            except Exception as e:
+                logger.debug(f"Final sync failed: {e}")
         self.sync_agent.stop()
         self.local_store.close()
 

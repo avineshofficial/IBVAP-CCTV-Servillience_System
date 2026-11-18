@@ -5,7 +5,7 @@
 
 # --- Core (Required for prototype) ---
 opencv-python-headless>=4.9   # Video capture, image processing, homography
-numpy>=1.26
+numpy>=1.26.0,<2.0.0          # Pinned <2.0.0 for PyTorch C-API compatibility
 
 # --- Backend (Core Platform) ---
 fastapi>=0.110.0              # Async REST API framework
@@ -27,7 +27,7 @@ rich>=13.7.0                  # Beautiful terminal output
 # --- AI / ML Models (required for real detection -- without these the
 # edge pipeline silently runs in SIMULATION mode with 4 fake synthetic
 # objects instead of your actual camera feed) ---
-ultralytics>=8.4.0             # YOLO26/YOLO11 detection + ByteTrack tracking
+ultralytics>=8.3.222            # YOLO26 (`yolo26n.pt`) NMS-free detection + ByteTrack tracking
 insightface>=0.7.3             # SCRFD face detection + ArcFace recognition
 onnxruntime>=1.17.0             # ONNX inference runtime (required by insightface)
 paddlepaddle>=3.0.0             # Required by paddleocr

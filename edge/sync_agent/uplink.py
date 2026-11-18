@@ -86,7 +86,8 @@ class SyncAgent:
 
             # Send to core
             headers = {"X-Edge-API-Key": self.api_key}
-            async with httpx.AsyncClient(timeout=30.0) as client:
+            timeout_cfg = httpx.Timeout(connect=2.0, read=3.0, write=3.0, pool=2.0)
+            async with httpx.AsyncClient(timeout=timeout_cfg) as client:
                 response = await client.post(
                     f"{self.core_api_url}/api/v1/edge/sync",
                     json=payload,
@@ -122,6 +123,10 @@ class SyncAgent:
             self._last_error = str(e)
             logger.warning(f"Sync error (will retry): {e}")
             return {"status": "error", "error": str(e)}
+
+    def sync_batch_sync(self, local_store) -> dict:
+        """Synchronous wrapper for execution on CPU background ThreadPoolExecutor."""
+        return asyncio.run(self.sync_batch(local_store))
 
     async def run_loop(self, local_store):
         """Run the sync loop continuously."""

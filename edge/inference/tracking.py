@@ -52,23 +52,30 @@ class TrackState:
 
 class Tracker:
     """
-    Multi-object tracker using ByteTrack via Ultralytics.
-    Maintains persistent track IDs and movement histories.
+    Multi-object tracker using ByteTrack via Ultralytics YOLO26.
+    Maintains persistent track IDs and movement histories with GPU acceleration.
     """
 
     def __init__(
         self,
-        model_name: str = "yolo11n.pt",
+        model_name: str = "yolo26n.pt",
         tracker_config: str = "bytetrack.yaml",
         confidence_threshold: float = 0.4,
         target_classes: list[int] = None,
         max_history_length: int = 100,
+        device: str = "cuda:0",
+        half: Optional[bool] = None,
+        imgsz: int = 640,
     ):
         self.model_name = model_name
         self.tracker_config = tracker_config
         self.confidence_threshold = confidence_threshold
         self.target_classes = target_classes or [0, 1, 2, 3, 5, 7]
         self.max_history_length = max_history_length
+        self.imgsz = imgsz
+
+        # Explicit hardware resolution: prioritize NVIDIA discrete GPU (cuda:0)
+        self._device, self._half = self._resolve_device(device, half)
 
         self._model = None
         self._initialized = False
@@ -81,19 +88,60 @@ class Tracker:
             3: "motorcycle", 5: "bus", 7: "truck",
         }
 
+    @staticmethod
+    def _resolve_device(requested_device: str, requested_half: Optional[bool]) -> tuple[str, bool]:
+        """Resolve inference device and half precision, falling back to CPU if CUDA is unavailable."""
+        try:
+            import torch
+            cuda_avail = torch.cuda.is_available()
+        except ImportError:
+            cuda_avail = False
+
+        dev_str = str(requested_device).strip().lower()
+
+        if dev_str.startswith("cuda") or dev_str in ("auto", "gpu"):
+            if cuda_avail:
+                resolved_dev = "cuda:0"
+                try:
+                    import torch
+                    gpu_name = torch.cuda.get_device_name(0)
+                    logger.info(f"ByteTracker binding to NVIDIA discrete GPU: {resolved_dev} ({gpu_name})")
+                except Exception:
+                    logger.info(f"ByteTracker binding to GPU: {resolved_dev}")
+                use_half = True if requested_half is None else requested_half
+                return resolved_dev, use_half
+            else:
+                logger.info("CUDA requested for ByteTrack but unavailable; falling back to CPU.")
+                return "cpu", False
+        else:
+            use_half = False if dev_str == "cpu" else (True if requested_half is None else requested_half)
+            return dev_str, use_half
+
     def initialize(self):
-        """Load the YOLO model for tracking, or fall back to simulation."""
+        """Load the YOLO26 model for tracking, or fall back to simulation."""
         if self._initialized:
             return
 
         try:
+            import os
+            from pathlib import Path
+            if "YOLO_CONFIG_DIR" not in os.environ:
+                cfg_dir = Path(__file__).resolve().parent.parent.parent / ".ultralytics"
+                cfg_dir.mkdir(parents=True, exist_ok=True)
+                os.environ["YOLO_CONFIG_DIR"] = str(cfg_dir)
+
             from ultralytics import YOLO
 
-            logger.info(f"Loading tracking model: {self.model_name}...")
+            logger.info(f"Loading tracking model: {self.model_name} on {self._device} (FP16={self._half})...")
             self._model = YOLO(self.model_name)
+            try:
+                self._model.to(self._device)
+            except Exception as e:
+                logger.warning(f"Could not bind tracking model to {self._device}: {e}")
+
             self._initialized = True
             self._simulation_mode = False
-            logger.info("Tracker initialized successfully (YOLO mode)")
+            logger.info("Tracker initialized successfully (YOLO26 mode)")
 
         except ImportError:
             logger.warning(
@@ -137,16 +185,20 @@ class Tracker:
             return self._simulate_update(frame, frame_id, camera_id, timestamp)
 
         try:
-            # Run YOLO tracking with ByteTrack (optimized 384p inference for ultra-fluid 25+ FPS)
-            results = self._model.track(
-                frame,
-                conf=self.confidence_threshold,
-                classes=self.target_classes,
-                tracker=self.tracker_config,
-                persist=True,
-                verbose=False,
-                imgsz=384,
-            )
+            # Run YOLO26 tracking with ByteTrack (NMS-free head, GPU/FP16 acceleration)
+            track_kwargs = {
+                "conf": self.confidence_threshold,
+                "classes": self.target_classes,
+                "tracker": self.tracker_config,
+                "persist": True,
+                "device": self._device,
+                "verbose": False,
+                "imgsz": self.imgsz,
+            }
+            if self._device.startswith("cuda"):
+                track_kwargs["half"] = self._half
+
+            results = self._model.track(frame, **track_kwargs)
 
             current_track_ids = set()
             active_tracks = []

@@ -139,6 +139,7 @@ class CameraStream:
                         cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
                         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
                         cap.set(cv2.CAP_PROP_FPS, self.target_fps)
+                        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # Minimal buffer for real-time low-latency CPU grabber
                     except Exception:
                         pass
 

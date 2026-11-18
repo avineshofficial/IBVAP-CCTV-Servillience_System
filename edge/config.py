@@ -5,6 +5,7 @@ All edge-layer settings. Loaded from environment variables with sensible default
 """
 
 import os
+import json
 from pathlib import Path
 from dataclasses import dataclass, field
 from dotenv import load_dotenv
@@ -12,6 +13,13 @@ from dotenv import load_dotenv
 # Project root
 PROJECT_ROOT = Path(__file__).parent.parent
 load_dotenv(PROJECT_ROOT / ".env")
+
+# Ensure Ultralytics config is stored inside the project workspace
+# to prevent WinError 5 access denied on AppData\Roaming in restricted/sandbox environments
+_ultralytics_dir = PROJECT_ROOT / ".ultralytics"
+_ultralytics_dir.mkdir(parents=True, exist_ok=True)
+os.environ.setdefault("YOLO_CONFIG_DIR", str(_ultralytics_dir))
+os.environ["YOLO_CONFIG_DIR"] = str(_ultralytics_dir)
 
 MODELS_DIR = PROJECT_ROOT / "ml" / "models"
 MEDIA_DIR = PROJECT_ROOT / "core" / "media"
@@ -36,8 +44,11 @@ class EdgeConfig:
     frame_width: int = int(os.getenv("FRAME_WIDTH", "1280"))
     frame_height: int = int(os.getenv("FRAME_HEIGHT", "720"))
 
-    # --- Detection ---
-    yolo_model: str = os.getenv("YOLO_MODEL", "yolo11n.pt")
+    # --- Detection (YOLO26 with RTX 3050 CUDA Acceleration) ---
+    yolo_model: str = os.getenv("YOLO_MODEL", "yolo26n.pt")
+    yolo_device: str = os.getenv("YOLO_DEVICE", "cuda:0")
+    yolo_half_precision: bool = os.getenv("YOLO_HALF_PRECISION", "true").lower() == "true"
+    yolo_imgsz: int = int(os.getenv("YOLO_IMGSZ", "640"))
     detection_confidence: float = float(os.getenv("DETECTION_CONFIDENCE", "0.6"))
     detection_classes: list = field(default_factory=lambda: [0, 1, 2, 3, 5, 7])
     # COCO classes: 0=person, 1=bicycle, 2=car, 3=motorcycle, 5=bus, 7=truck
@@ -63,6 +74,22 @@ class EdgeConfig:
     # --- Virtual Fence ---
     fence_enabled: bool = os.getenv("FENCE_ENABLED", "true").lower() == "true"
     dwell_time_threshold: float = float(os.getenv("DWELL_TIME_THRESHOLD", "30.0"))  # seconds
+
+    # --- Perspective Restricted Zone (calibrated to floor perspective) ---
+    # Calibrated to the floor perimeter matching the camera view:
+    #   - Top boundary perimeter: (0, 505) -> (1280, 505)
+    #   - Bottom floor coverage: (1280, 720) -> (0, 720)
+    # Can also be customized in .env via RESTRICTED_ZONE_POLYGON
+    restricted_zone_polygon: list = field(default_factory=lambda: (
+        [tuple(p) for p in json.loads(os.getenv("RESTRICTED_ZONE_POLYGON"))]
+        if os.getenv("RESTRICTED_ZONE_POLYGON")
+        else [
+            (0, 505),       # Far-left border point (aligned to blue perimeter)
+            (1280, 505),    # Far-right border point (aligned to blue perimeter)
+            (1280, 720),    # Bottom-right corner
+            (0, 720),       # Bottom-left corner
+        ]
+    ))
 
     # --- Activity Detection ---
     activity_detection_enabled: bool = os.getenv("ACTIVITY_DETECTION_ENABLED", "false").lower() == "true"
@@ -102,3 +129,53 @@ class EdgeConfig:
         elif src.isdigit():
             return int(src)
         return self.camera_source
+
+    def get_yolo_device(self) -> str:
+        """Resolve YOLO device, prioritizing CUDA and falling back to CPU if unavailable."""
+        dev = self.yolo_device.strip().lower()
+        if dev.startswith("cuda"):
+            try:
+                import torch
+                if not torch.cuda.is_available():
+                    return "cpu"
+            except Exception:
+                return "cpu"
+        elif dev in ("auto", "gpu"):
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    return "cuda:0"
+                return "cpu"
+            except Exception:
+                return "cpu"
+        return dev
+
+    def is_half_precision(self) -> bool:
+        """Determine if FP16 half-precision is supported and requested (CUDA only)."""
+        resolved_dev = self.get_yolo_device()
+        return self.yolo_half_precision and resolved_dev.startswith("cuda")
+
+    def get_device_description(self) -> str:
+        """Return human-readable execution device string, e.g. GPU: CUDA:0 FP16 (NVIDIA GeForce RTX 3050 Laptop GPU) or CPU (Intel Core i5-13420H)."""
+        dev = self.get_yolo_device()
+        if dev.startswith("cuda"):
+            gpu_name = "NVIDIA GeForce RTX 3050 Laptop GPU"
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    gpu_name = torch.cuda.get_device_name(0)
+            except Exception:
+                pass
+            fp16_str = "FP16" if self.is_half_precision() else "FP32"
+            return f"GPU: CUDA:0 {fp16_str} ({gpu_name})"
+        return "CPU: Intel Core i5-13420H"
+
+    def get_yolo_model_path(self) -> str:
+        """Resolve the model path, checking ml/models/ and root for yolo26n.pt."""
+        p = Path(self.yolo_model)
+        if p.exists():
+            return str(p)
+        in_models = self.models_dir / self.yolo_model
+        if in_models.exists():
+            return str(in_models)
+        return self.yolo_model

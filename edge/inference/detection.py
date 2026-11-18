@@ -77,43 +77,98 @@ class Detection:
 class Detector:
     """
     YOLO26-based object detector for humans and vehicles.
-    Uses Ultralytics library for inference.
+    Uses Ultralytics YOLO26n with RTX 3050 CUDA / FP16 acceleration.
     """
 
     def __init__(
         self,
-        model_name: str = "yolo11n.pt",
+        model_name: str = "yolo26n.pt",
         confidence_threshold: float = 0.4,
         target_classes: list[int] = None,
-        device: str = "auto",
+        device: str = "cuda:0",
+        half: Optional[bool] = None,
+        imgsz: int = 640,
     ):
         self.model_name = model_name
         self.confidence_threshold = confidence_threshold
         self.target_classes = target_classes or [0, 1, 2, 3, 5, 7]
-        self._device = device
+        self.imgsz = imgsz
+
+        # Explicit hardware resolution: prioritize NVIDIA discrete GPU (cuda:0)
+        self._device, self._half = self._resolve_device(device, half)
         self._model = None
         self._initialized = False
 
+    @staticmethod
+    def _resolve_device(requested_device: str, requested_half: Optional[bool]) -> tuple[str, bool]:
+        """Resolve inference device and half precision, falling back to CPU if CUDA is unavailable."""
+        try:
+            import torch
+            cuda_avail = torch.cuda.is_available()
+        except ImportError:
+            cuda_avail = False
+
+        dev_str = str(requested_device).strip().lower()
+
+        if dev_str.startswith("cuda") or dev_str in ("auto", "gpu"):
+            if cuda_avail:
+                resolved_dev = "cuda:0"
+                try:
+                    import torch
+                    gpu_name = torch.cuda.get_device_name(0)
+                    logger.info(f"YOLO26 Detector binding to NVIDIA discrete GPU: {resolved_dev} ({gpu_name})")
+                except Exception:
+                    logger.info(f"YOLO26 Detector binding to GPU: {resolved_dev}")
+                use_half = True if requested_half is None else requested_half
+                return resolved_dev, use_half
+            else:
+                logger.info("CUDA requested but torch.cuda.is_available() is False; gracefully falling back to CPU.")
+                return "cpu", False
+        else:
+            use_half = False if dev_str == "cpu" else (True if requested_half is None else requested_half)
+            return dev_str, use_half
+
     def initialize(self):
-        """Load the YOLO model. Called lazily on first detect() call."""
+        """Load the YOLO26 model. Called lazily on first detect() call."""
         if self._initialized:
             return
 
         try:
+            import os
+            from pathlib import Path
+            if "YOLO_CONFIG_DIR" not in os.environ:
+                cfg_dir = Path(__file__).resolve().parent.parent.parent / ".ultralytics"
+                cfg_dir.mkdir(parents=True, exist_ok=True)
+                os.environ["YOLO_CONFIG_DIR"] = str(cfg_dir)
+
             from ultralytics import YOLO
 
-            logger.info(f"Loading YOLO model: {self.model_name}...")
+            logger.info(f"Loading YOLO26 model: {self.model_name} on {self._device} (FP16={self._half})...")
             self._model = YOLO(self.model_name)
 
-            # Warm up with a dummy inference
-            dummy = np.zeros((640, 640, 3), dtype=np.uint8)
-            self._model.predict(dummy, verbose=False)
+            # Bind model to target hardware
+            try:
+                self._model.to(self._device)
+            except Exception as e:
+                logger.warning(f"Could not explicitly bind YOLO model to {self._device}: {e}")
+
+            # Warm up with a dummy inference using YOLO26 NMS-free predict signature
+            dummy = np.zeros((self.imgsz, self.imgsz, 3), dtype=np.uint8)
+            warmup_kwargs = {
+                "conf": self.confidence_threshold,
+                "imgsz": self.imgsz,
+                "device": self._device,
+                "verbose": False,
+            }
+            if self._device.startswith("cuda"):
+                warmup_kwargs["half"] = self._half
+            self._model.predict(dummy, **warmup_kwargs)
 
             self._initialized = True
-            logger.info(f"YOLO model loaded successfully: {self.model_name}")
+            logger.info(f"YOLO26 model loaded and warmed up successfully: {self.model_name}")
 
         except Exception as e:
-            logger.error(f"Failed to load YOLO model: {e}")
+            logger.error(f"Failed to load YOLO26 model: {e}")
             raise
 
     def detect(
@@ -133,13 +188,18 @@ class Detector:
             self.initialize()
 
         try:
-            results = self._model.predict(
-                frame,
-                conf=self.confidence_threshold,
-                classes=self.target_classes,
-                verbose=False,
-                imgsz=640,
-            )
+            # Prepare kwargs for YOLO26 NMS-free predict
+            predict_kwargs = {
+                "conf": self.confidence_threshold,
+                "classes": self.target_classes,
+                "imgsz": self.imgsz,
+                "device": self._device,
+                "verbose": False,
+            }
+            if self._device.startswith("cuda"):
+                predict_kwargs["half"] = self._half
+
+            results = self._model.predict(frame, **predict_kwargs)
 
             detections = []
             for result in results:
@@ -192,10 +252,32 @@ class Detector:
         ]
 
     @property
+    def active_device_str(self) -> str:
+        """Return human-readable active device description."""
+        if self._device.startswith("cuda"):
+            gpu_name = "NVIDIA GeForce RTX 3050 Laptop GPU"
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    gpu_name = torch.cuda.get_device_name(0)
+            except Exception:
+                pass
+            fp16_str = "FP16" if self._half else "FP32"
+            return f"GPU: CUDA:0 {fp16_str} ({gpu_name})"
+        return "CPU: Intel Core i5-13420H"
+
+    @property
+    def is_cuda(self) -> bool:
+        return self._device.startswith("cuda")
+
+    @property
     def model_info(self) -> dict:
         """Return model metadata."""
         return {
             "model_name": self.model_name,
+            "device": self._device,
+            "half_precision": self._half,
+            "device_description": self.active_device_str,
             "confidence_threshold": self.confidence_threshold,
             "target_classes": {cid: COCO_CLASSES.get(cid, "unknown") for cid in self.target_classes},
             "initialized": self._initialized,

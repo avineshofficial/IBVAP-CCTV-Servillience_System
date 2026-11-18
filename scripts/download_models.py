@@ -137,6 +137,33 @@ def create_sample_video(overwrite: bool = True):
         logger.warning(f"  ⚠ Failed to create sample video: {e}")
 
 
+def download_yolo_model(model_name: str = "yolo26n.pt") -> bool:
+    """Fetch and verify YOLO26 model via Ultralytics and cache in ml/models/."""
+    try:
+        from ultralytics import YOLO
+        import shutil
+
+        logger.info(f"\n📦 YOLO26 Model ({model_name}):")
+        dest = MODELS_DIR / model_name
+
+        # Load or auto-download model through Ultralytics
+        logger.info(f"  ↓ Fetching/verifying {model_name}...")
+        model = YOLO(model_name)
+
+        # Cache in expected ml/models/ directory
+        pt_file = Path(model_name)
+        if pt_file.exists() and pt_file.resolve() != dest.resolve():
+            shutil.copy2(pt_file, dest)
+            logger.info(f"  ✓ Successfully cached {model_name} in {dest}")
+        elif dest.exists():
+            logger.info(f"  ✓ Verified {model_name} exists in {dest}")
+
+        return True
+    except Exception as e:
+        logger.warning(f"  ⚠ Failed to download/verify {model_name}: {e}")
+        return False
+
+
 def main():
     logger.info("=" * 50)
     logger.info("IBVAP — Model & Sample Setup")
@@ -145,9 +172,8 @@ def main():
     MODELS_DIR.mkdir(parents=True, exist_ok=True)
     SAMPLE_DIR.mkdir(parents=True, exist_ok=True)
 
-    # YOLO model will be auto-downloaded by ultralytics on first run
-    logger.info("\n📦 YOLO Model:")
-    logger.info("  ℹ YOLO model auto-downloads on first inference run")
+    # Fetch and verify YOLO26n model
+    download_yolo_model("yolo26n.pt")
 
     # InsightFace models also auto-download
     logger.info("\n📦 InsightFace Models:")

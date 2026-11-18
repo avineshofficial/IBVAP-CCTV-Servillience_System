@@ -36,27 +36,52 @@ class FaceDetector:
         model_pack: str = "buffalo_l",
         det_size: tuple = (640, 640),
         det_threshold: float = 0.5,
+        device: str = "cuda:0",
     ):
         self.model_pack = model_pack
         self.det_size = det_size
         self.det_threshold = det_threshold
+        self.device = device
         self._app = None
         self._initialized = False
 
     def initialize(self):
-        """Load InsightFace models."""
+        """Load InsightFace models with GPU acceleration (cuda:0) and CPU fallback."""
         if self._initialized:
             return
 
         try:
             from insightface.app import FaceAnalysis
 
+            # Check CUDA and ONNXRuntime execution providers
+            cuda_available = False
+            try:
+                import torch
+                cuda_available = torch.cuda.is_available() and str(self.device).lower().startswith("cuda")
+            except ImportError:
+                pass
+
+            providers = ["CPUExecutionProvider"]
+            ctx_id = -1
+            if cuda_available:
+                try:
+                    import onnxruntime as ort
+                    if "CUDAExecutionProvider" in ort.get_available_providers():
+                        providers = [("CUDAExecutionProvider", {"device_id": 0}), "CPUExecutionProvider"]
+                        ctx_id = 0
+                        logger.info("Face detector configured with GPU acceleration: CUDAExecutionProvider (cuda:0)")
+                except Exception as e:
+                    logger.debug(f"ONNXRuntime CUDA provider check error: {e}")
+
+            if ctx_id == -1:
+                logger.info("Face detector running on CPU: CPUExecutionProvider")
+
             logger.info(f"Loading face analysis models ({self.model_pack})...")
             self._app = FaceAnalysis(
                 name=self.model_pack,
-                providers=["CPUExecutionProvider"],
+                providers=providers,
             )
-            self._app.prepare(ctx_id=-1, det_size=self.det_size)
+            self._app.prepare(ctx_id=ctx_id, det_size=self.det_size)
             self._initialized = True
             logger.info("Face detector initialized successfully")
 

@@ -47,9 +47,11 @@ class ANPREngine:
         self,
         confidence: float = 0.5,
         vote_frames: int = 5,
+        device: str = "cuda:0",
     ):
         self.confidence = confidence
         self.vote_frames = vote_frames
+        self.device = device
         self._ocr = None
         self._initialized = False
 
@@ -58,22 +60,33 @@ class ANPREngine:
         self._finalized: dict[int, str] = {}
 
     def initialize(self):
-        """Load PaddleOCR model."""
+        """Load PaddleOCR model with GPU acceleration (cuda:0) and CPU fallback."""
         if self._initialized:
             return
 
         try:
             from paddleocr import PaddleOCR
 
-            logger.info("Loading PaddleOCR for ANPR...")
+            use_gpu = False
+            try:
+                import torch
+                if torch.cuda.is_available() and str(self.device).lower().startswith("cuda"):
+                    import paddle
+                    if hasattr(paddle, "is_compiled_with_cuda") and paddle.is_compiled_with_cuda():
+                        use_gpu = True
+            except Exception:
+                pass
+
+            logger.info(f"Loading PaddleOCR for ANPR (use_gpu={use_gpu})...")
             self._ocr = PaddleOCR(
                 use_angle_cls=True,
                 lang="en",
                 show_log=False,
-                use_gpu=False,
+                use_gpu=use_gpu,
             )
             self._initialized = True
-            logger.info("ANPR engine initialized")
+            dev_label = "cuda:0 GPU" if use_gpu else "CPU"
+            logger.info(f"ANPR engine initialized successfully on {dev_label}")
 
         except ImportError:
             logger.warning(

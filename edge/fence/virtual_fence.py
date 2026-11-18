@@ -148,6 +148,15 @@ class VirtualFenceEngine:
 
     def add_zone(self, zone: FenceZone):
         """Register a virtual fence zone."""
+        # Block deprecated screen-splitting horizontal line
+        if zone.zone_id == "zone_border_line":
+            logger.info("Ignoring legacy screen-splitting line zone 'zone_border_line'")
+            return
+        if zone.rule_type == FenceRuleType.LINE_CROSS and len(zone.polygon_points_pixel) == 2:
+            p1, p2 = zone.polygon_points_pixel
+            if abs(p1[1] - p2[1]) < 10.0 and abs(p2[0] - p1[0]) >= 800:
+                logger.info(f"Ignoring legacy full-width horizontal dividing line '{zone.zone_id}'")
+                return
         self._zones[zone.zone_id] = zone
         logger.info(f"Added fence zone: {zone.name} ({zone.rule_type.value})")
 
@@ -333,6 +342,8 @@ class VirtualFenceEngine:
         for zone in self._zones.values():
             if not zone.is_active or zone.camera_id != camera_id:
                 continue
+            if zone.zone_id == "zone_border_line":
+                continue
 
             key = (track_id, zone.zone_id)
 
@@ -342,28 +353,22 @@ class VirtualFenceEngine:
             if timestamp - last_breach < self._cooldown_seconds:
                 continue
 
-            polygon = zone.polygon_points_pixel
-            is_inside = self._point_in_polygon(ground_point, polygon)
-            
-            # Robust overlap check: if ground point is outside, check if center or bounding box overlaps the restricted zone
-            if not is_inside and bbox is not None and len(bbox) == 4:
+            # Use bottom-center point of bounding box as the ground-contact point
+            if bbox is not None and len(bbox) == 4:
                 bx1, by1, bx2, by2 = bbox
-                c_pt = ((bx1 + bx2) / 2.0, (by1 + by2) / 2.0)
-                if self._point_in_polygon(c_pt, polygon):
-                    is_inside = True
-                else:
-                    test_pts = [
-                        (bx2, (by1 + by2) / 2.0),
-                        (bx1, (by1 + by2) / 2.0),
-                        ((bx1 + bx2) / 2.0, by1),
-                        (bx2, by2),
-                        (bx1, by2),
-                        ((bx1 + bx2) / 2.0, by2),
-                    ]
-                    for tp in test_pts:
-                        if self._point_in_polygon(tp, polygon):
-                            is_inside = True
-                            break
+                ground_contact_pt = ((bx1 + bx2) / 2.0, float(by2))
+            else:
+                ground_contact_pt = ground_point
+
+            polygon = zone.polygon_points_pixel
+
+            # High-precision point-in-polygon test via cv2.pointPolygonTest
+            if cv2 is not None and len(polygon) >= 3:
+                contour = np.array([(int(p[0]), int(p[1])) for p in polygon], dtype=np.int32)
+                # Returns >= 0 if inside polygon or on boundary
+                is_inside = cv2.pointPolygonTest(contour, (float(ground_contact_pt[0]), float(ground_contact_pt[1])), False) >= 0
+            else:
+                is_inside = self._point_in_polygon(ground_contact_pt, polygon)
 
             geo_point = self.pixel_to_geo(ground_point)
 
@@ -476,6 +481,73 @@ class VirtualFenceEngine:
 
         return breaches
 
+    def create_perspective_restricted_zone(
+        self,
+        polygon_points: list[tuple[float, float]],
+        camera_id: str = "cam_01",
+        frame_width: int = 1280,
+        frame_height: int = 720,
+        base_width: int = 1280,
+        base_height: int = 720,
+    ):
+        """
+        Create a perspective-based restricted zone following the camera's floor perspective.
+
+        The polygon should be a trapezoid (or any convex/concave polygon) that follows
+        the visible floor area in the camera view. The far edge (top of zone) should be
+        narrower, and the near edge (bottom of frame) should be wider — matching real
+        perspective foreshortening.
+
+        Coordinates scale automatically:
+        - If normalized (0.0 to 1.0), scaled by (frame_width, frame_height).
+        - If in pixel space, scaled from (base_width, base_height) to (frame_width, frame_height).
+
+        Args:
+            polygon_points: List of (x, y) tuples defining the restricted floor polygon.
+            camera_id: Camera identifier.
+            frame_width: Current frame width.
+            frame_height: Current frame height.
+            base_width: Reference width the coordinates were authored at (default: 1280).
+            base_height: Reference height the coordinates were authored at (default: 720).
+        """
+        # Clear any old straight-line and rectangular zones
+        for old_id in ("zone_border_line", "zone_restricted_area"):
+            if old_id in self._zones:
+                self.remove_zone(old_id)
+
+        zone_id = "zone_restricted_area"
+
+        # Scale coordinates correctly with video resolution
+        scaled_polygon = []
+        scale_x = frame_width / float(base_width) if base_width > 0 else 1.0
+        scale_y = frame_height / float(base_height) if base_height > 0 else 1.0
+
+        for x, y in polygon_points:
+            # Check if normalized [0.0 - 1.0]
+            if 0.0 <= x <= 1.0 and 0.0 <= y <= 1.0 and max(p[0] for p in polygon_points) <= 1.0:
+                sx = float(x * frame_width)
+                sy = float(y * frame_height)
+            else:
+                sx = float(x * scale_x)
+                sy = float(y * scale_y)
+            scaled_polygon.append((round(sx, 1), round(sy, 1)))
+
+        restricted_zone = FenceZone(
+            zone_id=zone_id,
+            name="Restricted Floor Zone",
+            camera_id=camera_id,
+            polygon_points_pixel=scaled_polygon,
+            rule_type=FenceRuleType.EXCLUSION,
+            severity=BreachSeverity.CRITICAL,
+        )
+        self.add_zone(restricted_zone)
+        logger.info(
+            f"Initialized perspective restricted zone with {len(scaled_polygon)} vertices "
+            f"for {camera_id} at {frame_width}x{frame_height}: {scaled_polygon}"
+        )
+
+    # ── Legacy aliases (kept for backward compatibility) ──
+
     def create_straight_border_line(
         self,
         frame_width: int = 1280,
@@ -483,32 +555,26 @@ class VirtualFenceEngine:
         camera_id: str = "cam_01",
         line_y_ratio: float = 0.52,
     ):
-        """Create a single high-visibility straight red border line across the screen."""
-        self._zones.clear()
-
-        y_pos = float(int(frame_height * line_y_ratio))
-        p1 = (0.0, y_pos)
-        p2 = (float(frame_width), y_pos)
-
-        border_line_zone = FenceZone(
-            zone_id="zone_border_line",
-            name="Border Line Alpha",
-            camera_id=camera_id,
-            polygon_points_pixel=[p1, p2],
-            rule_type=FenceRuleType.LINE_CROSS,
-            severity=BreachSeverity.CRITICAL,
-        )
-        self.add_zone(border_line_zone)
-        logger.info(f"Initialized straight border line at Y={y_pos:.0f} (0, {y_pos:.0f}) -> ({frame_width}, {y_pos:.0f}) for {camera_id}")
+        """Legacy: Create a straight border line. Now redirects to perspective zone."""
+        logger.info("create_straight_border_line() called — redirecting to perspective zone")
+        # Default 6-point perspective polygon lowered to floor level
+        default_polygon = [
+            (0.0, frame_height * 0.76),
+            (frame_width * 0.19, frame_height * 0.72),
+            (frame_width * 0.81, frame_height * 0.72),
+            (float(frame_width), frame_height * 0.76),
+            (float(frame_width), float(frame_height)),
+            (0.0, float(frame_height)),
+        ]
+        self.create_perspective_restricted_zone(default_polygon, camera_id, frame_width, frame_height)
 
     def create_restricted_border_zone(self, frame_width: int, frame_height: int, camera_id: str = "cam_01"):
-        """Alias for creating the straight border line."""
+        """Legacy alias."""
         self.create_straight_border_line(frame_width, frame_height, camera_id)
 
     def create_demo_zones(self, frame_width: int, frame_height: int, camera_id: str = "cam_01"):
-        """Backward-compatible alias for creating both border line + restricted area."""
+        """Backward-compatible alias."""
         self.create_straight_border_line(frame_width, frame_height, camera_id)
-        self.create_restricted_area_zone(frame_width, frame_height, camera_id)
 
     def create_restricted_area_zone(
         self,
@@ -517,37 +583,9 @@ class VirtualFenceEngine:
         camera_id: str = "cam_01",
         line_y_ratio: float = 0.52,
     ):
-        """
-        Create a full restricted AREA polygon covering everything below the border line.
-        When a person enters this area, an EXCLUSION breach alert is triggered.
-        This covers the entire lower portion of the camera view.
-        """
-        y_pos = float(int(frame_height * line_y_ratio))
-
-        # Full polygon: 4 corners covering the entire area below the border line
-        restricted_polygon = [
-            (0.0, y_pos),                        # top-left (on the border line)
-            (float(frame_width), y_pos),          # top-right (on the border line)
-            (float(frame_width), float(frame_height)),  # bottom-right
-            (0.0, float(frame_height)),           # bottom-left
-        ]
-
-        zone_id = "zone_restricted_area"
-
-        # Don't add duplicate
-        if zone_id in self._zones:
+        """Legacy: now a no-op since perspective zone is created by create_perspective_restricted_zone."""
+        # The perspective zone already covers the restricted area
+        if "zone_restricted_area" in self._zones:
             return
-
-        restricted_zone = FenceZone(
-            zone_id=zone_id,
-            name="Restricted Alert Area",
-            camera_id=camera_id,
-            polygon_points_pixel=restricted_polygon,
-            rule_type=FenceRuleType.EXCLUSION,
-            severity=BreachSeverity.CRITICAL,
-        )
-        self.add_zone(restricted_zone)
-        logger.info(
-            f"Initialized restricted area zone below Y={y_pos:.0f} "
-            f"(full cover: 4-corner polygon {frame_width}x{frame_height - int(y_pos)}px) for {camera_id}"
-        )
+        # Fallback: create default perspective zone
+        self.create_straight_border_line(frame_width, frame_height, camera_id)
