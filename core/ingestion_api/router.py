@@ -84,6 +84,13 @@ async def edge_sync(
                     )
                     db.add(sec_log)
 
+                # Extract real-time fields from edge data
+                edge_data = edge_alert.data if isinstance(edge_alert.data, dict) else {}
+                person_count = edge_data.get("person_count", 1)
+                severity_score = edge_data.get("severity_score")
+                face_image_url = edge_data.get("face_image_url")
+                face_capture_status = edge_data.get("face_capture_status", "pending")
+
                 db_alert = Alert(
                     severity=severity,
                     alert_type=edge_alert.alert_type,
@@ -91,6 +98,10 @@ async def edge_sync(
                     message=edge_alert.message,
                     bop_id=alert_bop,
                     data_json=edge_alert.data,
+                    person_count=person_count,
+                    severity_score=severity_score,
+                    face_image_url=face_image_url,
+                    face_capture_status=face_capture_status,
                 )
                 db.add(db_alert)
                 alerts_received += 1

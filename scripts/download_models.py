@@ -175,6 +175,14 @@ def main():
     # Fetch and verify YOLO26n model
     download_yolo_model("yolo26n.pt")
 
+    # YuNet Face Detection model
+    logger.info("\n📦 YuNet Face Detector:")
+    download_file(
+        "https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx",
+        MODELS_DIR / "face_detection_yunet_2023mar.onnx",
+        "YuNet Face Detection (ONNX)"
+    )
+
     # InsightFace models also auto-download
     logger.info("\n📦 InsightFace Models:")
     logger.info("  ℹ InsightFace models auto-download on first use")

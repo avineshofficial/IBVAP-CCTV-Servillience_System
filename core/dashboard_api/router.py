@@ -522,3 +522,29 @@ async def demo_tamper_record(record_id: int, user = Depends(require_role("admin"
         "original_hash": record.record_hash,
         "note": "Now call GET /api/v1/audit/verify-all to see the chain break",
     }
+
+
+
+# ──────────────────────────────────────
+# Live Location (Browser GPS → Location Service)
+# ──────────────────────────────────────
+
+@router.post("/system/live-location")
+async def update_live_location(data: dict):
+    """Receive browser GPS coordinates from the dashboard frontend."""
+    from core.alert_engine.location_service import get_location_service
+    svc = get_location_service()
+    lat = data.get("latitude")
+    lng = data.get("longitude")
+    accuracy = data.get("accuracy", 0)
+    if lat is not None and lng is not None:
+        svc.update_browser_gps(lat=float(lat), lng=float(lng), accuracy=float(accuracy))
+        return {"status": "ok", "source": "browser_gps"}
+    return {"status": "error", "message": "Missing latitude/longitude"}
+
+
+@router.get("/system/live-location")
+async def get_live_location():
+    """Return the current best-available live location."""
+    from core.alert_engine.location_service import get_location_service
+    return get_location_service().get_live_location()

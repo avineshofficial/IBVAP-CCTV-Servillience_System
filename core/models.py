@@ -73,6 +73,11 @@ class Alert(Base):
     bop_id = Column(String(50), nullable=True, default="unassigned")
     assigned_to = Column(Integer, ForeignKey("users.id"), nullable=True)
     data_json = Column(JSON, nullable=True)
+    person_count = Column(Integer, nullable=True, default=1)
+    face_image_url = Column(String(500), nullable=True)
+    face_capture_status = Column(String(20), nullable=True, default="pending")
+    # face_capture_status: pending, processing, captured, unavailable
+    severity_score = Column(Float, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     resolved_at = Column(DateTime, nullable=True)
     notes = Column(Text, nullable=True)

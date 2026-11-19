@@ -20,7 +20,31 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
     };
     updateClock();
     const timer = setInterval(updateClock, 1000);
-    return () => clearInterval(timer);
+
+    // Push browser GPS to core server for real-time location in alerts
+    let geoWatchId: number | undefined;
+    if (typeof navigator !== "undefined" && navigator.geolocation) {
+      geoWatchId = navigator.geolocation.watchPosition(
+        (pos) => {
+          fetch("http://localhost:8000/api/v1/system/live-location", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              latitude: pos.coords.latitude,
+              longitude: pos.coords.longitude,
+              accuracy: pos.coords.accuracy,
+            }),
+          }).catch(() => {});
+        },
+        () => {},
+        { enableHighAccuracy: true, maximumAge: 30000 }
+      );
+    }
+
+    return () => {
+      clearInterval(timer);
+      if (geoWatchId !== undefined) navigator.geolocation.clearWatch(geoWatchId);
+    };
   }, []);
 
   const handleRoleChange = async (role: "admin" | "post_commander" | "field_officer" | "hq_analyst") => {

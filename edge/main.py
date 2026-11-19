@@ -37,6 +37,70 @@ logging.basicConfig(
 )
 logger = logging.getLogger("IBVAP.Edge")
 
+# ── Composite Threat Severity Calculator ──
+# Dynamically computes severity from real-time telemetry
+
+# Activity threat weights for Random Forest / breach type classification
+_ACTIVITY_THREAT_WEIGHTS = {
+    "fence_cross": 1.0, "crossed_in": 1.0, "entered_exclusion": 1.0,
+    "crawl": 1.0, "crawling": 1.0,
+    "run": 0.85, "sprinting": 0.85,
+    "group": 0.85, "group_forming": 0.85,
+    "loiter": 0.65, "loitering": 0.65, "dwelling": 0.65,
+    "normal_walk": 0.55, "crossed_out": 0.45,
+    "touched_border_line": 0.90,
+}
+
+
+def calculate_incident_severity(
+    detection_confidence: float,
+    breach_type: str,
+    person_count: int,
+    dwell_seconds: float = 0.0,
+) -> tuple:
+    """
+    Calculate composite threat severity score from real-time telemetry.
+
+    Returns (severity_tier: str, severity_score: float, severity_pct: str)
+    """
+    # 1. YOLO Detection Confidence (25%)
+    conf_factor = min(max(detection_confidence, 0.0), 1.0)
+
+    # 2. Activity / Breach Risk (35%)
+    activity_factor = _ACTIVITY_THREAT_WEIGHTS.get(breach_type, 0.7)
+
+    # 3. Intruder Count Factor (20%)
+    if person_count >= 3:
+        count_factor = 1.0
+    elif person_count == 2:
+        count_factor = 0.85
+    else:
+        count_factor = 0.6
+
+    # 4. Dwell Time / Breach Depth (20%)
+    dwell_factor = min(dwell_seconds / 5.0, 1.0) if dwell_seconds else 0.5
+
+    # Weighted composite
+    raw_score = (
+        0.25 * conf_factor +
+        0.35 * activity_factor +
+        0.20 * count_factor +
+        0.20 * dwell_factor
+    )
+    severity_score = round(min(max(raw_score * 100.0, 0.0), 100.0), 1)
+
+    # Tier assignment
+    if severity_score >= 85.0:
+        tier = "critical"
+    elif severity_score >= 70.0:
+        tier = "high"
+    elif severity_score >= 45.0:
+        tier = "medium"
+    else:
+        tier = "low"
+
+    return tier, severity_score, f"{severity_score:.1f}%"
+
 
 class EdgePipeline:
     """
@@ -545,20 +609,44 @@ class EdgePipeline:
                 f"{total_output_frames} frames @ {target_fps} FPS = {actual_duration:.1f}s playback ({mp4_path.stat().st_size / 1024:.0f} KB)"
             )
 
-            # ── 2. TELEGRAM: Single sendVideo with incident caption (NO separate location/text) ──
+            # ── 2. FACE EXTRACTION + TELEGRAM: Extract faces then send single alert ──
+            face_image_paths = []
+            if mp4_success and mp4_path.exists() and mp4_path.stat().st_size > 10000:
+                try:
+                    from core.alert_engine.face_extractor import extract_faces_from_clip
+                    from core.config import CoreConfig as _CoreConfig
+                    faces_dir = str(_CoreConfig.MEDIA_DIR / "faces")
+                    temp_alert_id = f"breach_{alert_data.get('camera_id', 'cam') if alert_data else 'cam'}_{alert_data.get('track_id', 0) if alert_data else 0}_{int(time.time())}"
+                    face_result = extract_faces_from_clip(
+                        video_path=str(mp4_path),
+                        alert_id=temp_alert_id,
+                        output_dir=faces_dir,
+                    )
+                    if face_result.get("faces"):
+                        for fc in face_result["faces"]:
+                            fp = _CoreConfig.MEDIA_DIR / "faces" / Path(fc["face_image_url"]).name
+                            if fp.exists():
+                                face_image_paths.append(str(fp))
+                        logger.info(f"[FaceExtractor] Extracted {len(face_image_paths)} face(s) from {mp4_path.name}")
+                    else:
+                        logger.info(f"[FaceExtractor] No clear faces found in {mp4_path.name}")
+                except Exception as e_face:
+                    logger.warning(f"[FaceExtractor] Face extraction error: {e_face}")
+
             if telegram_enabled and mp4_success and mp4_path.exists() and mp4_path.stat().st_size > 10000 and alert_data:
                 try:
                     from core.alert_engine.telegram_notifier import get_telegram_notifier
                     notifier = get_telegram_notifier()
                     if notifier.enabled:
                         alert_id = f"breach_{alert_data.get('camera_id', 'cam')}_{alert_data.get('track_id', 0)}_{int(time.time())}"
-                        logger.info(f"[Telegram] Sending finalized 8s clip as single message: {mp4_path.name}")
+                        logger.info(f"[Telegram] Sending finalized 8s clip + {len(face_image_paths)} face(s): {mp4_path.name}")
                         notifier.send_alert_with_video_sync(
                             alert_id=alert_id,
                             alert_data=alert_data,
                             severity=severity,
                             message=message,
                             clip_path=str(mp4_path),
+                            face_image_paths=face_image_paths if face_image_paths else None,
                         )
                 except Exception as e_tg:
                     logger.warning(f"[Telegram] Video evidence upload error: {e_tg}")
@@ -1030,20 +1118,45 @@ class EdgePipeline:
 
                         # 1. Save instant high-resolution snapshot thumbnail
                         thumb_path = self._save_thumbnail(overlay, breach.track_id, packet.frame_id)
-                        alert_msg = f"{breach.breach_type} by {breach.object_class} in {breach.zone_name} (Track #{breach.track_id})"
+
+                        # Count unique persons in this zone's breach area
+                        zone_person_tracks = [b.track_id for b in zone_breaches if b.object_class == "person"]
+                        person_count = max(len(set(zone_person_tracks)), 1)
+                        active_track_ids = sorted(set(zone_person_tracks))
+
+                        # Calculate dynamic severity from real-time telemetry
+                        severity_tier, severity_score, severity_pct = calculate_incident_severity(
+                            detection_confidence=breach.confidence,
+                            breach_type=breach.breach_type,
+                            person_count=person_count,
+                            dwell_seconds=breach.dwell_time or 0.0,
+                        )
+
+                        # Build descriptive alert message
+                        tracks_str = ", ".join(f"#{t}" for t in active_track_ids)
+                        person_label = f"{person_count} Person{'s' if person_count > 1 else ''}"
+                        alert_msg = (
+                            f"{breach.breach_type} by {person_label} in {breach.zone_name} "
+                            f"(Track{'s' if person_count > 1 else ''} {tracks_str})"
+                        )
 
                         breach_data = {
                             "zone_id": breach.zone_id,
                             "zone_name": breach.zone_name,
                             "breach_type": breach.breach_type,
+                            "alert_type": "fence_breach",
                             "track_id": breach.track_id,
+                            "active_track_ids": active_track_ids,
                             "object_class": breach.object_class,
+                            "person_count": person_count,
+                            "confidence": round(breach.confidence, 4),
+                            "severity_score": severity_score,
+                            "severity_pct": severity_pct,
                             "ground_point": breach.ground_point_pixel,
                             "dwell_time": breach.dwell_time,
                             "thumbnail_path": thumb_path,
                             "camera_id": packet.camera_id,
-                            "latitude": self.config.default_camera_lat,
-                            "longitude": self.config.default_camera_lng,
+                            "timestamp": breach.timestamp,
                             "telegram_dispatched": True,
                         }
 
@@ -1052,7 +1165,7 @@ class EdgePipeline:
                             packet.camera_id,
                             breach.track_id,
                             alert_data=breach_data,
-                            severity=breach.severity,
+                            severity=severity_tier,
                             message=alert_msg,
                         )
                         breach_data["clip_url"] = clip_url
@@ -1067,7 +1180,7 @@ class EdgePipeline:
                         )
                         self.local_store.store_alert(
                             event_id=event_id,
-                            severity=breach.severity,
+                            severity=severity_tier,
                             alert_type="fence_breach",
                             message=alert_msg,
                             data=breach_data,

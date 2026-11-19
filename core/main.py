@@ -111,6 +111,7 @@ async def lifespan(app: FastAPI):
     CoreConfig.MEDIA_DIR.mkdir(parents=True, exist_ok=True)
     (CoreConfig.MEDIA_DIR / "thumbnails").mkdir(exist_ok=True)
     (CoreConfig.MEDIA_DIR / "clips").mkdir(exist_ok=True)
+    (CoreConfig.MEDIA_DIR / "faces").mkdir(exist_ok=True)
 
     logger.info(f"Core API ready at http://{CoreConfig.HOST}:{CoreConfig.PORT}")
     logger.info(f"Dashboard API docs at http://localhost:{CoreConfig.PORT}/docs")

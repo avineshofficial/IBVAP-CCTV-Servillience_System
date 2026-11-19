@@ -89,8 +89,6 @@ class EdgeConfig:
     telegram_enabled: bool = os.getenv("TELEGRAM_ENABLED", "true").lower() == "true"
     telegram_bot_token: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
     telegram_chat_id: str = os.getenv("TELEGRAM_CHAT_ID", "")
-    default_camera_lat: float = float(os.getenv("DEFAULT_CAMERA_LAT", "9.9252"))
-    default_camera_lng: float = float(os.getenv("DEFAULT_CAMERA_LNG", "78.1198"))
 
     # --- Perspective Restricted Zone (calibrated to floor perspective) ---
     # Calibrated to the floor perimeter matching the camera view:

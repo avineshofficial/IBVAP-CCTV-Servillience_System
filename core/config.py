@@ -46,7 +46,5 @@ class CoreConfig:
     TELEGRAM_ENABLED: bool = os.getenv("TELEGRAM_ENABLED", "true").lower() == "true"
     TELEGRAM_BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
     TELEGRAM_CHAT_ID: str = os.getenv("TELEGRAM_CHAT_ID", "")
-    DEFAULT_CAMERA_LAT: float = float(os.getenv("DEFAULT_CAMERA_LAT", "9.9252"))
-    DEFAULT_CAMERA_LNG: float = float(os.getenv("DEFAULT_CAMERA_LNG", "78.1198"))
 
 

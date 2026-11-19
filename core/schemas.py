@@ -80,6 +80,10 @@ class AlertUpdate(BaseModel):
 class AlertResponse(AlertBase):
     id: int
     status: str = "new"
+    person_count: Optional[int] = 1
+    face_image_url: Optional[str] = None
+    face_capture_status: Optional[str] = "pending"
+    severity_score: Optional[float] = None
     created_at: Optional[datetime] = None
     resolved_at: Optional[datetime] = None
     notes: Optional[str] = None

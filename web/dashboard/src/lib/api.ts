@@ -181,6 +181,10 @@ export interface Alert {
   created_at?: string | null;
   resolved_at?: string | null;
   notes?: string | null;
+  person_count?: number | null;
+  face_image_url?: string | null;
+  face_capture_status?: string | null;
+  severity_score?: number | null;
 }
 
 export interface DetectionEvent {

@@ -273,6 +273,11 @@ export default function AlertsPage() {
                         {isBreach && !!alert.data_json?.zone_name && (
                           <div className="text-[10px] text-cyan-400 font-mono mt-0.5">
                             ZONE: {String(alert.data_json.zone_name)} | TARGET #{String(alert.data_json.track_id ?? "?")}
+                            {alert.data_json?.person_count && Number(alert.data_json.person_count) > 1 ? (
+                              <span className="ml-1.5 px-1 py-0.5 bg-amber-950/60 border border-amber-700/50 text-amber-300 rounded-[2px] text-[9px] font-bold">
+                                {String(alert.data_json.person_count)} PERSONS
+                              </span>
+                            ) : null}
                           </div>
                         )}
                       </td>
@@ -420,6 +425,46 @@ export default function AlertsPage() {
               )}
             </div>
 
+            {/* Face Capture Evidence */}
+            {(() => {
+              const dj = selectedAlert.data_json || {};
+              const faces = (dj.faces as Array<{face_image_url: string}>) || [];
+              const faceUrl = dj.face_image_url as string | undefined;
+              const faceStatus = (dj.face_capture_status || selectedAlert.face_capture_status || "pending") as string;
+              const allFaces = faces.length > 0 ? faces : (faceUrl ? [{ face_image_url: faceUrl }] : []);
+
+              if (allFaces.length > 0) {
+                return (
+                  <div className="rounded-[4px] bg-[#080d1a] border border-[#162035] p-2.5">
+                    <div className="text-[10px] font-mono uppercase tracking-wider text-slate-400 mb-2 font-semibold flex items-center gap-1.5">
+                      <span>🧑 AI Face Capture</span>
+                      <span className="badge-status badge-critical text-[8px]">{allFaces.length} FACE{allFaces.length > 1 ? "S" : ""}</span>
+                    </div>
+                    <div className="flex gap-2 flex-wrap">
+                      {allFaces.map((f, i) => (
+                        <div key={i} className="w-20 h-20 rounded-[3px] overflow-hidden border border-cyan-800/50 bg-black">
+                          <img
+                            src={getMediaUrl(f.face_image_url)}
+                            alt={`Face ${i + 1}`}
+                            className="w-full h-full object-cover"
+                            onError={(e) => { (e.target as HTMLImageElement).style.display = "none"; }}
+                          />
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                );
+              }
+              if (faceStatus === "processing") {
+                return (
+                  <div className="rounded-[4px] bg-[#080d1a] border border-[#162035] p-2.5 text-xs font-mono text-cyan-400">
+                    🔄 AI Face Extraction Processing...
+                  </div>
+                );
+              }
+              return null;
+            })()}
+
             {/* Incident Summary Info */}
             <div className="p-2.5 rounded-[4px] bg-[#080d1a] border border-[#162035] space-y-1 text-xs font-mono">
               <div className="flex justify-between text-slate-400">
@@ -434,6 +479,32 @@ export default function AlertsPage() {
                 <span>Status:</span>
                 <span className="text-emerald-400 uppercase font-bold">{selectedAlert.status}</span>
               </div>
+              {/* Real-Time Enriched Fields */}
+              {selectedAlert.data_json?.person_count ? (
+                <div className="flex justify-between text-slate-400">
+                  <span>Persons Detected:</span>
+                  <span className="text-amber-400 font-bold">{String(selectedAlert.data_json.person_count)} Person{Number(selectedAlert.data_json.person_count) > 1 ? "s" : ""}</span>
+                </div>
+              ) : null}
+              {(selectedAlert.severity_score || selectedAlert.data_json?.severity_score) ? (
+                <div className="flex justify-between text-slate-400">
+                  <span>Severity Score:</span>
+                  <span className="text-rose-400 font-bold">{String(selectedAlert.severity_score || selectedAlert.data_json?.severity_score)}%</span>
+                </div>
+              ) : null}
+              {(selectedAlert.data_json?.latitude && selectedAlert.data_json?.longitude) ? (
+                <div className="flex justify-between text-slate-400">
+                  <span>GPS Location:</span>
+                  <a
+                    href={`https://www.google.com/maps?q=${selectedAlert.data_json.latitude},${selectedAlert.data_json.longitude}`}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="text-cyan-400 hover:text-cyan-200 underline"
+                  >
+                    📍 {String(selectedAlert.data_json.latitude)}, {String(selectedAlert.data_json.longitude)}
+                  </a>
+                </div>
+              ) : null}
             </div>
 
             {/* Modal Actions */}
