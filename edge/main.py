@@ -501,13 +501,13 @@ class EdgePipeline:
             mp4_success = False
             try:
                 import av
-                container_mp4 = av.open(str(tmp_mp4_path), mode="w")
+                container_mp4 = av.open(str(tmp_mp4_path), mode="w", options={"movflags": "+faststart"})
                 stream_mp4 = container_mp4.add_stream("libx264", rate=int(target_fps))
                 stream_mp4.width = target_w
                 stream_mp4.height = target_h
                 stream_mp4.pix_fmt = "yuv420p"
                 stream_mp4.options = {
-                    "crf": "26",
+                    "crf": "28",
                     "preset": "ultrafast",
                     "tune": "zerolatency",
                     "threads": "2",
@@ -545,18 +545,20 @@ class EdgePipeline:
                 f"{total_output_frames} frames @ {target_fps} FPS = {actual_duration:.1f}s playback ({mp4_path.stat().st_size / 1024:.0f} KB)"
             )
 
-            # ── 2. ZERO-LATENCY TELEGRAM UPLOAD (Send MP4 + Location IMMEDIATELY!) ──
-            if telegram_enabled and mp4_success and mp4_path.exists() and mp4_path.stat().st_size > 1000 and alert_data:
+            # ── 2. TELEGRAM: Single sendVideo with incident caption (NO separate location/text) ──
+            if telegram_enabled and mp4_success and mp4_path.exists() and mp4_path.stat().st_size > 10000 and alert_data:
                 try:
                     from core.alert_engine.telegram_notifier import get_telegram_notifier
                     notifier = get_telegram_notifier()
                     if notifier.enabled:
-                        logger.info(f"[Telegram] Fast-uploading finalized 8s incident video clip + live location pin: {mp4_path.name}")
-                        notifier.send_video_evidence_sync(
-                            video_path=str(mp4_path),
+                        alert_id = f"breach_{alert_data.get('camera_id', 'cam')}_{alert_data.get('track_id', 0)}_{int(time.time())}"
+                        logger.info(f"[Telegram] Sending finalized 8s clip as single message: {mp4_path.name}")
+                        notifier.send_alert_with_video_sync(
+                            alert_id=alert_id,
                             alert_data=alert_data,
                             severity=severity,
                             message=message,
+                            clip_path=str(mp4_path),
                         )
                 except Exception as e_tg:
                     logger.warning(f"[Telegram] Video evidence upload error: {e_tg}")
@@ -616,38 +618,6 @@ class EdgePipeline:
             logger.debug(f"Async alert sync error: {e}")
         finally:
             self._sync_in_progress = False
-
-    def _dispatch_edge_instant_alert(self, data: dict, severity: str, message: str, thumb_path: str):
-        """Send immediate real-time mobile alert notification (snapshot photo + GPS pin) from Edge."""
-        try:
-            from core.alert_engine.telegram_notifier import get_telegram_notifier
-            notifier = get_telegram_notifier()
-            if notifier.enabled:
-                logger.info(f"[Telegram] Dispatching instant mobile alert (photo + pin) for: {message}")
-                notifier.send_instant_alert_sync(
-                    alert_data=data,
-                    severity=severity,
-                    message=message,
-                    thumbnail_path=thumb_path,
-                )
-        except Exception as e:
-            logger.warning(f"[Edge Telegram Instant Alert] Error: {e}")
-
-    def _dispatch_edge_telegram_alert(self, data: dict, severity: str, message: str, clip_url: str):
-        """Send complete incident mobile alert notification from Edge."""
-        try:
-            from core.alert_engine.telegram_notifier import get_telegram_notifier
-            notifier = get_telegram_notifier()
-            if notifier.enabled:
-                notifier.send_incident_alert_sync(
-                    alert_data=data,
-                    severity=severity,
-                    message=message,
-                    clip_path=clip_url,
-                    wait_for_clip_seconds=15.0,
-                )
-        except Exception as e:
-            logger.warning(f"[Edge Telegram Alert] Error: {e}")
 
     def _draw_overlays(self, frame, tracks, fence_zones, breaches):
         """Draw modern high-precision surveillance overlays with breach alerts.
@@ -1114,20 +1084,8 @@ class EdgePipeline:
                     if new_alerts_created:
                         # Offload to CPU ThreadPoolExecutor so GPU detection loop never pauses on network I/O
                         self._io_executor.submit(self._sync_alerts_async)
-
-                        # ZERO-LATENCY TELEGRAM ALERT: Instantly transfer incident details and live GPS location pin (<300ms)!
-                        if self.config.telegram_enabled:
-                            logger.info(
-                                f"[TELEGRAM FAST DISPATCH] 🚨 Instantly transferring incident details & live GPS pin for "
-                                f"Track #{breach.track_id} in '{breach.zone_name}' (Chat ID: {self.config.telegram_chat_id})"
-                            )
-                            self._io_executor.submit(
-                                self._dispatch_edge_instant_alert,
-                                breach_data,
-                                breach.severity,
-                                alert_msg,
-                                thumb_path,
-                            )
+                        # Telegram alert is dispatched ONLY after 8s clip encoding completes
+                        # (inside _encode_strict_8s_clip) — no instant text/photo dispatch here
                 elif time.time() > self._active_breach_until:
                     self._breached_track_ids.clear()
                     self._breach_face_scanned.clear()

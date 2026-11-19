@@ -380,25 +380,22 @@ export default function AlertsPage() {
                     controls
                     autoPlay
                     playsInline
+                    muted
+                    preload="auto"
                     className={`w-full h-full object-contain ${videoBuffering ? "hidden" : "block"}`}
                     onLoadedData={() => setVideoBuffering(false)}
+                    onWaiting={() => setVideoBuffering(true)}
+                    onPlaying={() => setVideoBuffering(false)}
                     onError={() => {
-                      if (videoRetryKey < 7) {
+                      if (videoRetryKey < 3) {
                         setVideoBuffering(true);
-                        setTimeout(() => setVideoRetryKey((k) => k + 1), 2000);
+                        setTimeout(() => setVideoRetryKey((k) => k + 1), 1500);
                       } else {
                         setVideoBuffering(false);
                       }
                     }}
+                    src={getMediaUrl(getClipUrl(selectedAlert)!)}
                   >
-                    <source
-                      src={getMediaUrl(getClipUrl(selectedAlert)!).replace(/\.mp4$/, ".webm")}
-                      type="video/webm"
-                    />
-                    <source
-                      src={getMediaUrl(getClipUrl(selectedAlert)!)}
-                      type="video/mp4"
-                    />
                     Your browser does not support HTML5 video playback.
                   </video>
                   {videoBuffering && (

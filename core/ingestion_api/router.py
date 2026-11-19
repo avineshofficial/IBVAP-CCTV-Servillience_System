@@ -95,27 +95,7 @@ async def edge_sync(
                 db.add(db_alert)
                 alerts_received += 1
 
-                # Trigger Telegram notification asynchronously (8s video clip + caption + GPS pin)
-                try:
-                    from core.alert_engine.telegram_notifier import get_telegram_notifier
-                    notifier = get_telegram_notifier()
-                    if notifier.enabled:
-                        import asyncio
-                        alert_dict = edge_alert.data if isinstance(edge_alert.data, dict) else {}
-                        # If Edge already dispatched real-time alert, avoid duplicate notification
-                        if not alert_dict.get("telegram_dispatched"):
-                            asyncio.create_task(
-                                notifier.send_incident_alert(
-                                    alert_data=alert_dict,
-                                    severity=severity,
-                                    message=edge_alert.message,
-                                    clip_path=alert_dict.get("clip_url") or alert_dict.get("clip_path"),
-                                    thumbnail_path=alert_dict.get("thumbnail_path"),
-                                    wait_for_clip_seconds=15.0,
-                                )
-                            )
-                except Exception as e_tg:
-                    logger.debug(f"Telegram dispatch error: {e_tg}")
+                # Telegram notification is handled by edge/main.py after clip encoding
 
                 # Import here to avoid circular reference
                 from core.audit_chain.ledger import audit_ledger
