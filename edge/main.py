@@ -17,6 +17,7 @@ import numpy as np
 import signal
 from pathlib import Path
 from datetime import datetime
+from typing import Optional, Tuple, Dict, List, Any
 
 # Add parent to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -48,22 +49,34 @@ class EdgePipeline:
         self._running = False
         self._frame_count = 0
         self._start_time = 0.0
-        # Rolling buffer for pre-incident footage: stores every 3rd frame (~5fps into buffer)
-        # 60 entries = ~12 seconds of coverage, more than enough for 3.5s pre-incident
-        self._frame_buffer = collections.deque(maxlen=60)
-        self._active_recorders = []
-        self._last_breach_clip_time = 0.0
-        self._active_breach_until = 0.0
-        self._active_incident_lock_until = 0.0
+
+        # ── Incident Clip Recording (Strict 8s: 4s Pre + 4s Post) ──
+        # Pre-event ring buffer: stores (monotonic_timestamp, frame) tuples.
+        # Continuously pruned to hold exactly the last PRE_ALERT_BUFFER_SECONDS (4.0s)
+        # of annotated frames at full inference FPS (every frame, not subsampled).
+        self._pre_event_buffer: collections.deque = collections.deque()
+        # Active clip recorder state (at most ONE active capture at a time)
+        self._clip_recorder = None  # dict or None
+        self._clip_lock = False     # True while an 8s capture window is in progress
+
+        # ── 10-Second Zone-Level Alert Cooldown ──
+        # State machine: ARMED (ready) → COOLDOWN (10s timer active)
+        # Key: zone_id → monotonic timestamp when cooldown expires
+        self._zone_cooldown_until: dict[str, float] = {}
         self._breached_track_ids = set()
-        # Per-person alert cooldown: prevents flooding duplicate alerts for the same person,
-        # while ensuring EVERY person who breaches triggers an alert independently
-        self._track_alert_cooldown: dict[int, float] = {}
+        self._active_breach_until = 0.0
+
+        # State flags for smooth live streaming and low-latency processing
+        self._live_frame_writing = False
+        self._zone_contours: dict[str, np.ndarray] = {}
+        self._breach_face_scanned: set[int] = set()
+        self._breach_anpr_scanned: set[int] = set()
+        self._sync_in_progress = False
 
         # Background CPU ThreadPoolExecutor for asynchronous non-blocking I/O
-        # (clip encoding, disk thumbnail writing, live frame streaming, and core uplink sync)
+        # (clip encoding, disk thumbnail writing, live frame streaming, core uplink sync, and Telegram alerts)
         from concurrent.futures import ThreadPoolExecutor
-        self._io_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="ibvap_cpu_io")
+        self._io_executor = ThreadPoolExecutor(max_workers=8, thread_name_prefix="ibvap_cpu_io")
 
         # Statistics
         self._stats = {
@@ -92,7 +105,7 @@ class EdgePipeline:
             height=self.config.frame_height,
         )
 
-        # Tracker (YOLO26 detection + ByteTrack with RTX 3050 CUDA / FP16 acceleration)
+        # Tracker (YOLO26 detection + ByteTrack with RTX 3050 CUDA / FP16 acceleration & Stride Optimization)
         self.tracker = Tracker(
             model_name=self.config.get_yolo_model_path(),
             tracker_config=self.config.tracker_type,
@@ -101,6 +114,7 @@ class EdgePipeline:
             device=self.config.get_yolo_device(),
             half=self.config.is_half_precision(),
             imgsz=self.config.yolo_imgsz,
+            stride=self.config.get_inference_stride(),
         )
 
         # Virtual Fence
@@ -293,83 +307,273 @@ class EdgePipeline:
         except Exception:
             self._core_reachable = False
 
-    def _start_incident_clip_recording(self, camera_id: str, track_id: int) -> str:
+    def _prune_pre_event_buffer(self):
+        """Remove frames older than PRE_ALERT_BUFFER_SECONDS from the pre-event ring buffer."""
+        cutoff = time.monotonic() - self.config.pre_alert_buffer_seconds
+        while self._pre_event_buffer and self._pre_event_buffer[0][0] < cutoff:
+            self._pre_event_buffer.popleft()
+
+    def _start_clip_capture(
+        self,
+        camera_id: str,
+        track_id: int,
+        alert_data: Optional[dict] = None,
+        severity: str = "critical",
+        message: str = "",
+    ) -> str:
         """
-        Record a focused 8.0-second incident clip (~3.5s BEFORE and ~4.5s AFTER line touch/crossing).
-        Calculates exact writer FPS so playback in the web player lasts exactly 7 to 8 seconds at 1x real-time speed.
+        Start a strict 8-second incident clip capture (4s pre + 4s post, with dynamic compensation).
+
+        Returns the clip URL path, or "" on failure.
         """
         try:
-            now = time.time()
-            # If an active recorder is already running, prevent duplicate/corrupt clips
-            if self._active_recorders:
-                return self._active_recorders[0]["clip_url"]
+            if self._clip_lock:
+                # Capture already in progress — return existing clip URL
+                if self._clip_recorder:
+                    return self._clip_recorder["clip_url"]
+                return ""
 
-            if now - self._last_breach_clip_time < 5.0:
-                ts = int(self._last_breach_clip_time)
-                return f"/media/clips/incident_{camera_id}_trk{track_id}_{ts}.webm"
+            now_mono = time.monotonic()
+            now_wall = time.time()
 
-            self._last_breach_clip_time = now
             clips_dir = self.config.media_dir / "clips"
             clips_dir.mkdir(parents=True, exist_ok=True)
-            ts = int(now)
-            filename = f"incident_{camera_id}_trk{track_id}_{ts}.webm"
+            ts = int(now_wall)
+            filename = f"incident_{camera_id}_trk{track_id}_{ts}.mp4"
             out_path = clips_dir / filename
+            clip_url = f"/media/clips/{filename}"
 
-            # 1. Snapshot past ~3.5 seconds of rolling frames (3.5s BEFORE incident)
-            pre_incident_frames = [f for t, f in self._frame_buffer if t >= (now - 3.5)]
-            if not pre_incident_frames and self._frame_buffer:
-                pre_incident_frames = [f for _, f in list(self._frame_buffer)[-15:]]
+            # 1. Snapshot the pre-event buffer (up to 4.0s of recent frames)
+            pre_frames = [(t, f.copy()) for t, f in self._pre_event_buffer]
+            if pre_frames:
+                actual_pre_duration = now_mono - pre_frames[0][0]
+            else:
+                actual_pre_duration = 0.0
 
-            rec = {
+            # 2. Dynamic window compensation: if pre-buffer is short, extend post capture
+            total_target = self.config.clip_duration_seconds  # 8.0
+            post_duration = max(
+                self.config.post_alert_buffer_seconds,
+                total_target - actual_pre_duration,
+            )
+
+            self._clip_lock = True
+            self._clip_recorder = {
                 "camera_id": camera_id,
                 "track_id": track_id,
                 "filename": filename,
                 "out_path": out_path,
-                "clip_url": f"/media/clips/{filename}",
-                "frames": list(pre_incident_frames),
-                "stop_time": now + 4.5,  # capture 4.5s AFTER touch -> total 8.0s
-                "target_duration": 8.0,
+                "clip_url": clip_url,
+                "pre_frames": pre_frames,
+                "post_frames": [],
+                "trigger_mono": now_mono,
+                "stop_mono": now_mono + post_duration,
+                "total_target": total_target,
+                "actual_pre_duration": actual_pre_duration,
+                "alert_data": alert_data or {},
+                "severity": severity,
+                "message": message,
             }
-            self._active_recorders.append(rec)
             logger.info(
-                f"[INCIDENT CAPTURE STARTED] Snapshot {len(pre_incident_frames)} frames (3.5s BEFORE). "
-                f"Capturing next 4.5s AFTER touch for track #{track_id} -> total ~8.0s video ({filename})"
+                f"[INCIDENT CAPTURE STARTED] Pre-buffer: {len(pre_frames)} frames ({actual_pre_duration:.1f}s). "
+                f"Post capture: {post_duration:.1f}s. Total target: {total_target:.1f}s. "
+                f"Track #{track_id} → {filename}"
             )
-            return f"/media/clips/{filename}"
+            return clip_url
         except Exception as e:
-            logger.warning(f"Failed to start incident clip recording: {e}")
+            logger.warning(f"Failed to start incident clip capture: {e}")
+            self._clip_lock = False
+            self._clip_recorder = None
             return ""
 
-    def _save_incident_clip(self, camera_id: str, track_id: int) -> str:
-        return self._start_incident_clip_recording(camera_id, track_id)
+    def _feed_clip_recorder(self, frame: np.ndarray):
+        """Append the current annotated frame to the active clip recorder if one is running."""
+        if not self._clip_recorder:
+            return
 
-    def _encode_clip_background(self, out_path: Path, frames: list, target_duration: float = 8.0):
-        def _encode_worker():
+        now_mono = time.monotonic()
+        self._clip_recorder["post_frames"].append((now_mono, frame.copy()))
+
+        # Check if post-capture window has elapsed
+        if now_mono >= self._clip_recorder["stop_mono"]:
+            self._finalize_clip()
+
+    def _finalize_clip(self):
+        """Finalize the current clip recorder: merge pre + post frames and encode to MP4."""
+        rec = self._clip_recorder
+        if rec is None:
+            return
+
+        # Merge pre + post frames
+        all_frames_ts = rec["pre_frames"] + rec["post_frames"]
+        all_frames = [f for _, f in all_frames_ts]
+
+        out_path = rec["out_path"]
+        total_target = rec["total_target"]
+        clip_target_fps = self.config.clip_target_fps
+        alert_data = rec.get("alert_data")
+        severity = rec.get("severity", "critical")
+        message = rec.get("message", "")
+        telegram_enabled = self.config.telegram_enabled
+
+        self._clip_recorder = None
+        self._clip_lock = False
+
+        logger.info(
+            f"[INCIDENT CAPTURE COMPLETE] Collected {len(all_frames)} raw frames. "
+            f"Encoding {total_target:.1f}s MP4 at {clip_target_fps} FPS → {rec['filename']}"
+        )
+
+        # Offload encoding to background CPU thread
+        self._io_executor.submit(
+            self._encode_strict_8s_clip,
+            out_path,
+            all_frames,
+            total_target,
+            clip_target_fps,
+            alert_data,
+            severity,
+            message,
+            telegram_enabled,
+        )
+
+    @staticmethod
+    def _encode_strict_8s_clip(
+        out_path: Path,
+        raw_frames: list,
+        target_duration: float,
+        target_fps: float,
+        alert_data: Optional[dict] = None,
+        severity: str = "critical",
+        message: str = "",
+        telegram_enabled: bool = False,
+    ):
+        """
+        Encode raw_frames into standard HTML5 browser-playable video files (both H.264 MP4 and VP8 WebM)
+        with strictly target_duration seconds of playback.
+
+        Resamples raw_frames to exactly (target_fps * target_duration) output frames
+        by nearest-neighbor index mapping across the input timeline.
+        Outputs:
+          1. .mp4: Standard H.264 (yuv420p) via PyAV (plays natively in Chrome, Edge, Safari, Firefox)
+          2. .webm: Standard VP8 via PyAV / OpenCV (preferred HTML5 web format)
+        Result: exactly 8.0s playback in any browser player.
+
+        Automatically dispatches 8s video evidence to Telegram when encoding completes.
+        """
+        try:
+            if not raw_frames:
+                logger.warning("No frames to encode for incident clip")
+                return
+
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+
+            h, w = raw_frames[0].shape[:2]
+            # Fast mobile resolution for rapid encoding and transfer (max 960px width, even dimensions)
+            if w > 960:
+                target_w = 960
+                target_h = int(h * (960 / w))
+            else:
+                target_w = w
+                target_h = h
+            target_w = target_w - (target_w % 2)
+            target_h = target_h - (target_h % 2)
+
+            total_output_frames = int(target_fps * target_duration)  # e.g. 20 * 8 = 160
+            n_input = len(raw_frames)
+
+            # Resample: map each output frame index to the nearest input frame index
+            indices = [int(i * n_input / total_output_frames) for i in range(total_output_frames)]
+            indices = [min(idx, n_input - 1) for idx in indices]
+
+            # Prepare resampled frames, guaranteeing consistent dimensions
+            resampled_frames = []
+            for idx in indices:
+                f = raw_frames[idx]
+                if f.shape[:2] != (target_h, target_w):
+                    f = cv2.resize(f, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
+                resampled_frames.append(f)
+
+            mp4_path = out_path.with_suffix(".mp4")
+            tmp_mp4_path = mp4_path.with_name(f"{mp4_path.stem}.tmp.mp4")
+
+            # ── 1. Fast Encode Browser-Native H.264 MP4 (Universal HTML5/Telegram playback) ──
+            mp4_success = False
             try:
-                if not frames:
-                    return
-                out_path.parent.mkdir(parents=True, exist_ok=True)
-                h, w = frames[0].shape[:2]
+                import av
+                container_mp4 = av.open(str(tmp_mp4_path), mode="w")
+                stream_mp4 = container_mp4.add_stream("libx264", rate=int(target_fps))
+                stream_mp4.width = target_w
+                stream_mp4.height = target_h
+                stream_mp4.pix_fmt = "yuv420p"
+                stream_mp4.options = {
+                    "crf": "26",
+                    "preset": "ultrafast",
+                    "tune": "zerolatency",
+                    "threads": "2",
+                }
+                for f in resampled_frames:
+                    av_frame = av.VideoFrame.from_ndarray(f, format="bgr24")
+                    for packet in stream_mp4.encode(av_frame):
+                        container_mp4.mux(packet)
+                for packet in stream_mp4.encode():
+                    container_mp4.mux(packet)
+                container_mp4.close()
+                os.replace(tmp_mp4_path, mp4_path)
+                mp4_success = True
+            except Exception as e_av:
+                logger.warning(f"PyAV H.264 encode unavailable ({e_av}), falling back to OpenCV mp4v")
+                try:
+                    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+                    writer = cv2.VideoWriter(str(tmp_mp4_path), fourcc, target_fps, (target_w, target_h))
+                    for f in resampled_frames:
+                        writer.write(f)
+                    writer.release()
+                    os.replace(tmp_mp4_path, mp4_path)
+                    mp4_success = True
+                except Exception as e_cv:
+                    logger.warning(f"OpenCV MP4 fallback failed: {e_cv}")
+                    if tmp_mp4_path.exists():
+                        try:
+                            tmp_mp4_path.unlink()
+                        except Exception:
+                            pass
 
-                # Dynamically set writer FPS so video playback in HTML5 player is exactly 7.5 - 8.0s!
-                num_frames = len(frames)
-                fps = max(3.0, min(30.0, round(num_frames / target_duration, 1)))
+            actual_duration = total_output_frames / target_fps
+            logger.info(
+                f"[EVIDENCE SAVED] {mp4_path.name} (H.264: {mp4_success}): "
+                f"{total_output_frames} frames @ {target_fps} FPS = {actual_duration:.1f}s playback ({mp4_path.stat().st_size / 1024:.0f} KB)"
+            )
 
-                webm_path = out_path.with_suffix(".webm")
-                fourcc = cv2.VideoWriter_fourcc(*"VP80")
-                writer = cv2.VideoWriter(str(webm_path), fourcc, fps, (w, h))
-                for f in frames:
-                    writer.write(f)
-                writer.release()
-                logger.info(
-                    f"[EVIDENCE CAPTURE COMPLETE] Saved 7.5s WebM clip on CPU I/O worker: {webm_path.name} "
-                    f"({num_frames} frames @ {fps} FPS = {num_frames/fps:.1f}s playback)"
-                )
-            except Exception as e:
-                logger.warning(f"Failed to encode incident clip: {e}")
+            # ── 2. ZERO-LATENCY TELEGRAM UPLOAD (Send MP4 + Location IMMEDIATELY!) ──
+            if telegram_enabled and mp4_success and mp4_path.exists() and mp4_path.stat().st_size > 1000 and alert_data:
+                try:
+                    from core.alert_engine.telegram_notifier import get_telegram_notifier
+                    notifier = get_telegram_notifier()
+                    if notifier.enabled:
+                        logger.info(f"[Telegram] Fast-uploading finalized 8s incident video clip + live location pin: {mp4_path.name}")
+                        notifier.send_video_evidence_sync(
+                            video_path=str(mp4_path),
+                            alert_data=alert_data,
+                            severity=severity,
+                            message=message,
+                        )
+                except Exception as e_tg:
+                    logger.warning(f"[Telegram] Video evidence upload error: {e_tg}")
 
-        # Offload encoding to background CPU ThreadPoolExecutor so GPU loop never pauses
-        self._io_executor.submit(_encode_worker)
+        except Exception as e:
+            logger.warning(f"Failed to encode incident clip: {e}")
+
+    def _save_incident_clip(
+        self,
+        camera_id: str,
+        track_id: int,
+        alert_data: Optional[dict] = None,
+        severity: str = "critical",
+        message: str = "",
+    ) -> str:
+        """Convenience alias used by the alert handler."""
+        return self._start_clip_capture(camera_id, track_id, alert_data, severity, message)
 
     def _save_thumbnail(self, frame, track_id: int, frame_id: int) -> str:
         """Save a detection thumbnail to disk asynchronously via ThreadPoolExecutor."""
@@ -398,13 +602,52 @@ class EdgePipeline:
             os.replace(tmp_path, live_path)
         except Exception:
             pass
+        finally:
+            self._live_frame_writing = False
 
     def _sync_alerts_async(self):
         """Asynchronously trigger uplink sync batch to Core API on CPU executor."""
+        if getattr(self, "_sync_in_progress", False):
+            return
+        self._sync_in_progress = True
         try:
             self.sync_agent.sync_batch_sync(self.local_store)
         except Exception as e:
             logger.debug(f"Async alert sync error: {e}")
+        finally:
+            self._sync_in_progress = False
+
+    def _dispatch_edge_instant_alert(self, data: dict, severity: str, message: str, thumb_path: str):
+        """Send immediate real-time mobile alert notification (snapshot photo + GPS pin) from Edge."""
+        try:
+            from core.alert_engine.telegram_notifier import get_telegram_notifier
+            notifier = get_telegram_notifier()
+            if notifier.enabled:
+                logger.info(f"[Telegram] Dispatching instant mobile alert (photo + pin) for: {message}")
+                notifier.send_instant_alert_sync(
+                    alert_data=data,
+                    severity=severity,
+                    message=message,
+                    thumbnail_path=thumb_path,
+                )
+        except Exception as e:
+            logger.warning(f"[Edge Telegram Instant Alert] Error: {e}")
+
+    def _dispatch_edge_telegram_alert(self, data: dict, severity: str, message: str, clip_url: str):
+        """Send complete incident mobile alert notification from Edge."""
+        try:
+            from core.alert_engine.telegram_notifier import get_telegram_notifier
+            notifier = get_telegram_notifier()
+            if notifier.enabled:
+                notifier.send_incident_alert_sync(
+                    alert_data=data,
+                    severity=severity,
+                    message=message,
+                    clip_path=clip_url,
+                    wait_for_clip_seconds=15.0,
+                )
+        except Exception as e:
+            logger.warning(f"[Edge Telegram Alert] Error: {e}")
 
     def _draw_overlays(self, frame, tracks, fence_zones, breaches):
         """Draw modern high-precision surveillance overlays with breach alerts.
@@ -425,7 +668,9 @@ class EdgePipeline:
 
             is_intruder = False
             for ez in exclusion_zones:
-                contour = np.array([(int(p[0]), int(p[1])) for p in ez.polygon_points_pixel], dtype=np.int32)
+                if ez.zone_id not in self._zone_contours:
+                    self._zone_contours[ez.zone_id] = np.array([(int(p[0]), int(p[1])) for p in ez.polygon_points_pixel], dtype=np.int32)
+                contour = self._zone_contours[ez.zone_id]
                 # Point-in-polygon test: >= 0 means on edge or inside the restricted floor polygon
                 if cv2.pointPolygonTest(contour, bottom_center, False) >= 0:
                     is_intruder = True
@@ -442,7 +687,9 @@ class EdgePipeline:
         # 1. Draw Virtual Fence Zones (Perspective Ground-Attached)
         # ──────────────────────────────────────────────────────────
         for zone in fence_zones:
-            pts = np.array([(int(p[0]), int(p[1])) for p in zone.polygon_points_pixel], np.int32)
+            if zone.zone_id not in self._zone_contours:
+                self._zone_contours[zone.zone_id] = np.array([(int(p[0]), int(p[1])) for p in zone.polygon_points_pixel], dtype=np.int32)
+            pts = self._zone_contours[zone.zone_id]
             if len(pts) < 3:
                 continue  # Need at least 3 points for a polygon
 
@@ -450,50 +697,21 @@ class EdgePipeline:
 
             if zone.rule_type.value == "exclusion":
                 # ── PERSPECTIVE GROUND-ATTACHED RESTRICTED ZONE ──
-                # Subtle transparent red shadow on the floor polygon with soft feathered edges
-
-                # Create a mask for the polygon shape
-                mask = np.zeros((h, w), dtype=np.uint8)
-                cv2.fillPoly(mask, [pts], 255)
-
-                # Apply Gaussian blur for soft feathered edges
-                mask_soft = cv2.GaussianBlur(mask, (31, 31), 15)
-
-                # Normalize mask to 0.0 - 1.0 range
-                mask_float = mask_soft.astype(np.float32) / 255.0
-
-                # Determine zone color and intensity based on breach state
-                if zone_breached:
-                    pulse = int(time.time() * 3) % 2 == 0
-                    # Subtle red tint: slightly more visible when breached
-                    red_intensity = 0.18 if pulse else 0.14
-                    border_color = (0, 0, 255)  # Bright red border
-                    border_th = 2
-                else:
-                    red_intensity = 0.10  # Very subtle 10% red shadow (floor texture preserved)
-                    border_color = (0, 0, 180)  # Muted red border
-                    border_th = 1
-
-                # Create the red tint overlay using the soft mask
-                # Only apply to the masked region (ROI-bounded for performance)
+                # Subtle transparent red shadow on the floor polygon with fast ROI blending (<0.7ms)
                 bx, by, bw, bh = cv2.boundingRect(pts)
                 bx2r, by2r = min(bx + bw, w), min(by + bh, h)
                 bx, by = max(bx, 0), max(by, 0)
                 if bw > 0 and bh > 0:
                     roi = overlay[by:by2r, bx:bx2r]
-                    mask_roi = mask_float[by:by2r, bx:bx2r]
+                    tint = roi.copy()
+                    pts_shifted = pts - np.array([bx, by])
+                    tint_color = (0, 0, 240) if zone_breached else (0, 0, 160)
+                    cv2.fillPoly(tint, [pts_shifted], tint_color)
+                    alpha = 0.18 if zone_breached else 0.10
+                    cv2.addWeighted(tint, alpha, roi, 1.0 - alpha, 0, dst=roi)
 
-                    # Create a red-tinted version of the ROI
-                    red_layer = roi.copy()
-                    red_layer[:, :, 2] = np.clip(red_layer[:, :, 2].astype(np.float32) + 60, 0, 255).astype(np.uint8)  # Boost red channel
-                    red_layer[:, :, 1] = (red_layer[:, :, 1].astype(np.float32) * 0.85).astype(np.uint8)  # Slightly reduce green
-                    red_layer[:, :, 0] = (red_layer[:, :, 0].astype(np.float32) * 0.85).astype(np.uint8)  # Slightly reduce blue
-
-                    # Blend using the soft mask
-                    mask_3ch = np.stack([mask_roi, mask_roi, mask_roi], axis=2)
-                    blended = (roi.astype(np.float32) * (1.0 - mask_3ch * red_intensity) +
-                               red_layer.astype(np.float32) * (mask_3ch * red_intensity))
-                    overlay[by:by2r, bx:bx2r] = np.clip(blended, 0, 255).astype(np.uint8)
+                border_color = (0, 0, 255) if zone_breached else (0, 0, 180)
+                border_th = 2 if zone_breached else 1
 
                 # Draw thin perspective boundary polyline (the "floor perimeter")
                 cv2.polylines(overlay, [pts], True, border_color, border_th, cv2.LINE_AA)
@@ -573,19 +791,22 @@ class EdgePipeline:
         # ──────────────────────────────────────────────────────────
         # 3. Top Banner Trigger for Border Breach Intrusion Alert
         # ──────────────────────────────────────────────────────────
+        now_mono = time.monotonic()
+        cd_rem = max([0.0] + [until - now_mono for until in self._zone_cooldown_until.values()])
+
         if has_active_breach:
             pulse = int(time.time() * 5) % 2 == 0
             banner_bg = (0, 0, 230) if pulse else (0, 0, 160)
             cv2.rectangle(overlay, (0, 0), (w, 42), banner_bg, -1)
             cv2.line(overlay, (0, 42), (w, 42), (255, 255, 255), 2)
-            breach_msg = "[ALERT SIGNAL] RESTRICTED BORDER PERIMETER BREACHED! INTRUSION DETECTED"
-            (tw, th), _ = cv2.getTextSize(breach_msg, cv2.FONT_HERSHEY_SIMPLEX, 0.60, 2)
+            if cd_rem > 0:
+                breach_msg = f"[ALERT SIGNAL] RESTRICTED BORDER BREACHED! INTRUSION DETECTED | COOLDOWN: {cd_rem:.1f}s"
+            else:
+                breach_msg = "[ALERT SIGNAL] RESTRICTED BORDER PERIMETER BREACHED! INTRUSION DETECTED"
+            (tw, th), _ = cv2.getTextSize(breach_msg, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2)
             tx = max(10, (w - tw) // 2)
-            cv2.putText(overlay, breach_msg, (tx, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.60, (255, 255, 255), 2, cv2.LINE_AA)
-            # Skip old 2-line drawing below
+            cv2.putText(overlay, breach_msg, (tx, 27), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2, cv2.LINE_AA)
             pass
-
-
 
         # ──────────────────────────────────────────────────────────
         # 4. Systems Status Overlay (Sleek Compact Top-Left Pill)
@@ -594,9 +815,25 @@ class EdgePipeline:
         active_cnt = self._stats['tracks_active']
         stats_text = f"CAM-01 | {fps_val:.1f} FPS | {active_cnt} TARGET{'S' if active_cnt != 1 else ''}"
         (tw, th), _ = cv2.getTextSize(stats_text, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
-        cv2.rectangle(overlay, (12, 12), (24 + tw, 20 + th + 6), (15, 20, 25), -1)
-        cv2.rectangle(overlay, (12, 12), (24 + tw, 20 + th + 6), (0, 255, 200), 1)
+        pill_right = 24 + tw
+        cv2.rectangle(overlay, (12, 12), (pill_right, 20 + th + 6), (15, 20, 25), -1)
+        cv2.rectangle(overlay, (12, 12), (pill_right, 20 + th + 6), (0, 255, 200), 1)
         cv2.putText(overlay, stats_text, (18, 18 + th), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 200), 1, cv2.LINE_AA)
+
+        # Cooldown Pill (if cooldown active but not currently breached)
+        if not has_active_breach and cd_rem > 0:
+            cd_text = f"COOLDOWN: {cd_rem:.1f}s"
+            (cw, ch), _ = cv2.getTextSize(cd_text, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
+            cv2.rectangle(overlay, (pill_right + 8, 12), (pill_right + 20 + cw, 20 + ch + 6), (25, 20, 10), -1)
+            cv2.rectangle(overlay, (pill_right + 8, 12), (pill_right + 20 + cw, 20 + ch + 6), (0, 180, 255), 1)
+            cv2.putText(overlay, cd_text, (pill_right + 14, 18 + ch), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 180, 255), 1, cv2.LINE_AA)
+
+        # Recording Indicator (top-right REC badge when active capture in progress)
+        if getattr(self, "_clip_lock", False):
+            rec_pulse = int(time.time() * 2) % 2 == 0
+            if rec_pulse:
+                cv2.circle(overlay, (w - 70, 22), 6, (0, 0, 255), -1)
+            cv2.putText(overlay, "REC [8s]", (w - 58, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.40, (0, 0, 255), 1, cv2.LINE_AA)
 
         return overlay
 
@@ -704,8 +941,11 @@ class EdgePipeline:
                     person_tracks = [t for t in tracks if t.class_name == "person" and t.is_active]
                     for track in person_tracks[:3]:  # Limit to 3 persons per frame
                         is_breached_target = track.track_id in self._breached_track_ids
-                        # Gate execution: run on breach (immediate), new track (frame 1), or sampled every 15 frames
-                        should_run_face = is_breached_target or (track.frame_count == 1) or (track.frame_count % 15 == 0)
+                        is_new_breach = is_breached_target and (track.track_id not in self._breach_face_scanned)
+                        # Gate execution: run on first breach, new track (frame 1), or sampled every 30 frames
+                        should_run_face = is_new_breach or (track.frame_count == 1) or (track.frame_count % 30 == 0)
+                        if is_breached_target:
+                            self._breach_face_scanned.add(track.track_id)
                         if should_run_face:
                             x1, y1, x2, y2 = [int(c) for c in track.bbox]
                             h, w = frame.shape[:2]
@@ -724,8 +964,11 @@ class EdgePipeline:
                     ]
                     for track in vehicle_tracks[:3]:
                         is_breached_target = track.track_id in self._breached_track_ids
-                        # Gate execution: run on breach (immediate), new track (frame 1), or sampled every 15 frames
-                        should_run_anpr = is_breached_target or (track.frame_count == 1) or (track.frame_count % 15 == 0)
+                        is_new_breach_anpr = is_breached_target and (track.track_id not in self._breach_anpr_scanned)
+                        # Gate execution: run on first breach, new track (frame 1), or sampled every 30 frames
+                        should_run_anpr = is_new_breach_anpr or (track.frame_count == 1) or (track.frame_count % 30 == 0)
+                        if is_breached_target:
+                            self._breach_anpr_scanned.add(track.track_id)
                         if should_run_anpr:
                             x1, y1, x2, y2 = [int(c) for c in track.bbox]
                             h, w = frame.shape[:2]
@@ -767,91 +1010,128 @@ class EdgePipeline:
                 overlay = self._draw_overlays(
                     frame, tracks, cached_zones, all_breaches
                 )
-                # Store frame with timestamp for incident extraction (copy only every 3rd frame to reduce memory pressure)
-                if self._frame_count % 3 == 0:
-                    self._frame_buffer.append((time.time(), overlay.copy()))
 
-                # Feed active incident recorders (encoded asynchronously in CPU ThreadPoolExecutor)
-                if self._active_recorders:
-                    frame_copy = overlay.copy()  # Single copy shared across all recorders
-                    still_active = []
-                    for rec in self._active_recorders:
-                        rec["frames"].append(frame_copy)
-                        if time.time() >= rec["stop_time"]:
-                            self._encode_clip_background(rec["out_path"], rec["frames"], rec.get("target_duration", 8.0))
-                        else:
-                            still_active.append(rec)
-                    self._active_recorders = still_active
+                # ── Pre-Event Ring Buffer (continuous, every frame, pruned to 4.0s) ──
+                self._pre_event_buffer.append((time.monotonic(), overlay.copy()))
+                self._prune_pre_event_buffer()
+
+                # ── Feed Active Clip Recorder (if capture in progress) ──
+                if self._clip_lock:
+                    self._feed_clip_recorder(overlay)
 
                 # Save live frame for real-time frontend streaming (non-blocking CPU worker thread)
-                if self._frame_count % 3 == 0:
+                if not self._live_frame_writing:
                     try:
-                        ret, jpeg_buf = cv2.imencode(".jpg", overlay, [cv2.IMWRITE_JPEG_QUALITY, 70])
+                        ret, jpeg_buf = cv2.imencode(".jpg", overlay, [cv2.IMWRITE_JPEG_QUALITY, 65])
                         if ret:
+                            self._live_frame_writing = True
                             self._io_executor.submit(self._write_live_frame_async, jpeg_buf, packet.camera_id)
                     except Exception:
                         pass
 
-                # Store fence breach alerts for all breaching persons (per-person cooldown)
-                now_breach = time.time()
+                # ══════════════════════════════════════════════════════════
+                # ALERT STATE MACHINE (10s Zone Cooldown + Occupancy Re-Trigger)
+                # ══════════════════════════════════════════════════════════
+                now_mono = time.monotonic()
+
                 if all_breaches:
-                    self._active_breach_until = now_breach + 5.0
+                    self._active_breach_until = time.time() + 5.0
                     for b in all_breaches:
                         self._breached_track_ids.add(b.track_id)
 
-                    # Group breaches by track_id so each breaching person is alerted independently
-                    breaches_by_track = {}
+                    # Group breaches by zone so each zone is evaluated independently
+                    breaches_by_zone: dict[str, list] = {}
                     for b in all_breaches:
-                        if b.track_id not in breaches_by_track:
-                            breaches_by_track[b.track_id] = b
+                        breaches_by_zone.setdefault(b.zone_id, []).append(b)
 
                     new_alerts_created = False
-                    for trk_id, breach in breaches_by_track.items():
-                        # Per-person alert cooldown: ensures every person triggers an alert,
-                        # while rate-limiting repeat alerts for the exact same person to 5.0s
-                        last_alert_time = self._track_alert_cooldown.get(trk_id, 0.0)
-                        if now_breach - last_alert_time >= 5.0:
-                            self._track_alert_cooldown[trk_id] = now_breach
+                    for zone_id, zone_breaches in breaches_by_zone.items():
+                        cooldown_until = self._zone_cooldown_until.get(zone_id, 0.0)
+                        if now_mono < cooldown_until:
+                            # Cooldown active — suppress alert for this zone
+                            continue
 
-                            clip_url = ""
-                            if len(self._frame_buffer) >= 3:
-                                clip_url = self._save_incident_clip(packet.camera_id, breach.track_id)
+                        # Cooldown expired (or first alert) — TRIGGER!
+                        # Pick the highest-confidence breach in this zone as the representative
+                        breach = max(zone_breaches, key=lambda b: b.confidence)
 
-                            breach_data = {
-                                "zone_id": breach.zone_id,
-                                "zone_name": breach.zone_name,
-                                "breach_type": breach.breach_type,
-                                "track_id": breach.track_id,
-                                "object_class": breach.object_class,
-                                "ground_point": breach.ground_point_pixel,
-                                "dwell_time": breach.dwell_time,
-                                "clip_url": clip_url,
-                                "camera_id": packet.camera_id,
-                            }
-                            event_id = self.local_store.store_event(
-                                event_type="fence_breach",
-                                camera_id=packet.camera_id,
-                                data=breach_data,
-                                track_id=breach.track_id,
-                                confidence=breach.confidence,
-                                timestamp=breach.timestamp,
-                            )
-                            self.local_store.store_alert(
-                                event_id=event_id,
-                                severity=breach.severity,
-                                alert_type="fence_breach",
-                                message=f"{breach.breach_type} by {breach.object_class} in {breach.zone_name} (Track #{breach.track_id})",
-                                data=breach_data,
-                            )
-                            self._stats["fence_breaches"] += 1
-                            self._stats["alerts_generated"] += 1
-                            new_alerts_created = True
+                        # Start 10-second cooldown
+                        self._zone_cooldown_until[zone_id] = now_mono + self.config.alert_cooldown_seconds
+
+                        # 1. Save instant high-resolution snapshot thumbnail
+                        thumb_path = self._save_thumbnail(overlay, breach.track_id, packet.frame_id)
+                        alert_msg = f"{breach.breach_type} by {breach.object_class} in {breach.zone_name} (Track #{breach.track_id})"
+
+                        breach_data = {
+                            "zone_id": breach.zone_id,
+                            "zone_name": breach.zone_name,
+                            "breach_type": breach.breach_type,
+                            "track_id": breach.track_id,
+                            "object_class": breach.object_class,
+                            "ground_point": breach.ground_point_pixel,
+                            "dwell_time": breach.dwell_time,
+                            "thumbnail_path": thumb_path,
+                            "camera_id": packet.camera_id,
+                            "latitude": self.config.default_camera_lat,
+                            "longitude": self.config.default_camera_lng,
+                            "telegram_dispatched": True,
+                        }
+
+                        # 2. Start strict 8-second clip capture (with alert metadata so encoder can auto-dispatch video)
+                        clip_url = self._save_incident_clip(
+                            packet.camera_id,
+                            breach.track_id,
+                            alert_data=breach_data,
+                            severity=breach.severity,
+                            message=alert_msg,
+                        )
+                        breach_data["clip_url"] = clip_url
+
+                        event_id = self.local_store.store_event(
+                            event_type="fence_breach",
+                            camera_id=packet.camera_id,
+                            data=breach_data,
+                            track_id=breach.track_id,
+                            confidence=breach.confidence,
+                            timestamp=breach.timestamp,
+                        )
+                        self.local_store.store_alert(
+                            event_id=event_id,
+                            severity=breach.severity,
+                            alert_type="fence_breach",
+                            message=alert_msg,
+                            data=breach_data,
+                        )
+                        self._stats["fence_breaches"] += 1
+                        self._stats["alerts_generated"] += 1
+                        new_alerts_created = True
+                        logger.info(
+                            f"[ALERT #{self._stats['alerts_generated']}] Zone '{breach.zone_name}' — "
+                            f"Track #{breach.track_id} ({breach.object_class}). "
+                            f"Next alert eligible at +{self.config.alert_cooldown_seconds:.0f}s"
+                        )
 
                     if new_alerts_created:
                         # Offload to CPU ThreadPoolExecutor so GPU detection loop never pauses on network I/O
                         self._io_executor.submit(self._sync_alerts_async)
-                elif now_breach > self._active_breach_until:
+
+                        # ZERO-LATENCY TELEGRAM ALERT: Instantly transfer incident details and live GPS location pin (<300ms)!
+                        if self.config.telegram_enabled:
+                            logger.info(
+                                f"[TELEGRAM FAST DISPATCH] 🚨 Instantly transferring incident details & live GPS pin for "
+                                f"Track #{breach.track_id} in '{breach.zone_name}' (Chat ID: {self.config.telegram_chat_id})"
+                            )
+                            self._io_executor.submit(
+                                self._dispatch_edge_instant_alert,
+                                breach_data,
+                                breach.severity,
+                                alert_msg,
+                                thumb_path,
+                            )
+                elif time.time() > self._active_breach_until:
                     self._breached_track_ids.clear()
+                    self._breach_face_scanned.clear()
+                    self._breach_anpr_scanned.clear()
 
                 # --- Update Stats ---
                 elapsed = time.time() - self._start_time
@@ -900,10 +1180,17 @@ class EdgePipeline:
         self._running = False
         logger.info("Shutting down edge pipeline...")
 
+        # Finalize and encode any in-flight clip capture before releasing resources
+        if getattr(self, "_clip_recorder", None):
+            try:
+                self._finalize_clip()
+            except Exception as e:
+                logger.warning(f"Error finalizing in-flight clip during shutdown: {e}")
+
         self.camera.release()
         if hasattr(self, "_io_executor"):
             try:
-                self._io_executor.shutdown(wait=False, cancel_futures=True)
+                self._io_executor.shutdown(wait=True, cancel_futures=False)
             except Exception:
                 pass
         if getattr(self, "_core_reachable", False):

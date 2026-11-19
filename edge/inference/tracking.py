@@ -66,6 +66,7 @@ class Tracker:
         device: str = "cuda:0",
         half: Optional[bool] = None,
         imgsz: int = 640,
+        stride: int = 1,
     ):
         self.model_name = model_name
         self.tracker_config = tracker_config
@@ -73,6 +74,7 @@ class Tracker:
         self.target_classes = target_classes or [0, 1, 2, 3, 5, 7]
         self.max_history_length = max_history_length
         self.imgsz = imgsz
+        self.stride = max(1, stride)
 
         # Explicit hardware resolution: prioritize NVIDIA discrete GPU (cuda:0)
         self._device, self._half = self._resolve_device(device, half)
@@ -133,6 +135,13 @@ class Tracker:
             from ultralytics import YOLO
 
             logger.info(f"Loading tracking model: {self.model_name} on {self._device} (FP16={self._half})...")
+            if self._device == "cpu":
+                try:
+                    import torch
+                    torch.set_num_threads(4)
+                except Exception:
+                    pass
+
             self._model = YOLO(self.model_name)
             try:
                 self._model.to(self._device)
@@ -169,10 +178,12 @@ class Tracker:
         frame_id: int = 0,
         camera_id: str = "cam_01",
         timestamp: float = None,
+        stride: Optional[int] = None,
     ) -> list[TrackState]:
         """
         Run detection + tracking on a frame.
-        Returns list of active TrackState objects.
+        Supports stride optimization: on non-stride frames, reuses active tracks
+        to maintain buttery-smooth 25-30 FPS visual display without pipeline lag.
         """
         if not self._initialized:
             self.initialize()
@@ -183,6 +194,17 @@ class Tracker:
         # Simulation mode — generate synthetic detections
         if getattr(self, '_simulation_mode', False):
             return self._simulate_update(frame, frame_id, camera_id, timestamp)
+
+        # Stride optimization: skip full neural net inference on intermediate frames
+        effective_stride = stride if stride is not None else self.stride
+        if effective_stride > 1 and (frame_id % effective_stride != 0):
+            active_tracks = []
+            for track in self._tracks.values():
+                if track.is_active:
+                    track.last_seen = timestamp
+                    track.frame_count += 1
+                    active_tracks.append(track)
+            return active_tracks
 
         try:
             # Run YOLO26 tracking with ByteTrack (NMS-free head, GPU/FP16 acceleration)
@@ -230,6 +252,7 @@ class Tracker:
                         # Update existing track
                         track = self._tracks[track_id]
                         old_gp = track.ground_point
+                        dt = max(0.001, timestamp - track.last_seen)
 
                         track.bbox = bbox
                         track.confidence = confidence
@@ -244,7 +267,6 @@ class Tracker:
                             track.ground_point_history.pop(0)
 
                         # Calculate speed in m/s (using 35.0 px/m scale factor)
-                        dt = timestamp - (track.last_seen - 0.001)
                         if dt > 0:
                             dx_m = (ground_point[0] - old_gp[0]) / 35.0
                             dy_m = (ground_point[1] - old_gp[1]) / 35.0

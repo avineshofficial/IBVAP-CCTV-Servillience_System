@@ -299,6 +299,56 @@ async def purge_alerts(
     return {"message": "All alerts and detection events purged successfully"}
 
 
+@router.post("/alerts/test-telegram")
+async def test_telegram_alert(
+    chat_id: Optional[str] = Query(None, description="Optional target Telegram Chat ID"),
+):
+    """
+    Test endpoint to verify Telegram Bot API mobile alert delivery.
+    Sends a sample 8-second MP4 incident video clip, formatted HTML alert details,
+    and interactive live GPS location pin.
+    """
+    import time
+    from core.alert_engine.telegram_notifier import get_telegram_notifier
+    notifier = get_telegram_notifier()
+    if chat_id:
+        notifier.chat_id = chat_id
+
+    # Find the most recent MP4 clip in core/media/clips/ for test dispatch
+    clips_dir = CoreConfig.MEDIA_DIR / "clips"
+    sample_clip = None
+    if clips_dir.exists():
+        mp4_files = sorted(list(clips_dir.glob("*.mp4")), key=lambda p: p.stat().st_mtime, reverse=True)
+        if mp4_files:
+            sample_clip = str(mp4_files[0])
+
+    sample_alert_data = {
+        "zone_name": "Restricted Border Perimeter",
+        "zone_id": "zone_restricted_area",
+        "alert_type": "fence_breach",
+        "breach_type": "entered_exclusion",
+        "activity": "fence_cross / suspicious_intrusion",
+        "confidence": 0.942,
+        "camera_id": "CAM-01",
+        "bop_id": "Border Sector Alpha",
+        "track_id": 14,
+        "object_class": "person",
+        "latitude": notifier.default_lat,
+        "longitude": notifier.default_lng,
+        "timestamp": time.time(),
+        "clip_url": sample_clip,
+    }
+
+    result = await notifier.send_incident_alert(
+        alert_data=sample_alert_data,
+        severity="critical",
+        message="entered_exclusion by person in Restricted Border Perimeter (Track #14)",
+        clip_path=sample_clip,
+        wait_for_clip_seconds=0.0,
+    )
+    return result
+
+
 @router.delete("/alerts/{alert_id}")
 async def delete_single_alert(
     alert_id: int,

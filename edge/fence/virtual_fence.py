@@ -78,7 +78,7 @@ class VirtualFenceEngine:
     - Direction-of-travel validation
     """
 
-    def __init__(self):
+    def __init__(self, alert_cooldown_seconds: float = 10.0):
         self._zones: dict[str, FenceZone] = {}
         self._homography_matrix: Optional[np.ndarray] = None
         self._inverse_homography: Optional[np.ndarray] = None
@@ -87,12 +87,12 @@ class VirtualFenceEngine:
         self._dwell_tracker: dict[tuple[int, str], float] = {}
         # Track crossing state: {(track_id, zone_id): was_inside}
         self._crossing_state: dict[tuple[int, str], bool] = {}
-        # Breach cooldown: {(track_id, zone_id): last_breach_time}
-        self._breach_cooldown: dict[tuple[int, str], float] = {}
-        # Zone-level incident cooldown (prevents nonstop alerts queue spam)
-        self._zone_breach_cooldown: dict[str, float] = {}
-        self._cooldown_seconds = 5.0
-        self._zone_cooldown_seconds = 5.0
+        # Breach cooldown is now managed exclusively at the EdgePipeline level
+        # (zone-level cooldown with occupancy re-triggering).
+        # The fence engine itself does NOT suppress repeated breaches.
+        # This ensures the caller (EdgePipeline) always sees breach events when
+        # a person is inside the polygon, and the caller applies its own
+        # 10-second cooldown with continuous occupancy re-triggering.
 
     def calibrate(
         self,
@@ -347,12 +347,6 @@ class VirtualFenceEngine:
 
             key = (track_id, zone.zone_id)
 
-            # Check track-specific cooldown: ensures the same person doesn't re-trigger duplicate alerts every frame,
-            # while allowing EVERY OTHER PERSON to be evaluated and alerted independently.
-            last_breach = self._breach_cooldown.get(key, 0)
-            if timestamp - last_breach < self._cooldown_seconds:
-                continue
-
             # Use bottom-center point of bounding box as the ground-contact point
             if bbox is not None and len(bbox) == 4:
                 bx1, by1, bx2, by2 = bbox
@@ -476,8 +470,6 @@ class VirtualFenceEngine:
 
             if breach:
                 breaches.append(breach)
-                self._breach_cooldown[key] = timestamp
-                self._zone_breach_cooldown[zone.zone_id] = timestamp
 
         return breaches
 

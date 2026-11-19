@@ -53,9 +53,10 @@ class EdgeConfig:
     detection_classes: list = field(default_factory=lambda: [0, 1, 2, 3, 5, 7])
     # COCO classes: 0=person, 1=bicycle, 2=car, 3=motorcycle, 5=bus, 7=truck
 
-    # --- Tracking ---
+    # --- Tracking & Inference Stride ---
     tracker_type: str = os.getenv("TRACKER_TYPE", "bytetrack.yaml")
     track_buffer: int = int(os.getenv("TRACK_BUFFER", "30"))
+    inference_stride: int = int(os.getenv("INFERENCE_STRIDE", "0"))  # 0 = auto (1 on CUDA GPU, 2 on CPU)
 
     # --- Night Enhancement ---
     night_enhance_enabled: bool = os.getenv("NIGHT_ENHANCE_ENABLED", "false").lower() == "true"
@@ -74,6 +75,22 @@ class EdgeConfig:
     # --- Virtual Fence ---
     fence_enabled: bool = os.getenv("FENCE_ENABLED", "true").lower() == "true"
     dwell_time_threshold: float = float(os.getenv("DWELL_TIME_THRESHOLD", "30.0"))  # seconds
+
+    # --- Incident Clip Recording ---
+    clip_duration_seconds: float = float(os.getenv("CLIP_DURATION_SECONDS", "8.0"))
+    pre_alert_buffer_seconds: float = float(os.getenv("PRE_ALERT_BUFFER_SECONDS", "4.0"))
+    post_alert_buffer_seconds: float = float(os.getenv("POST_ALERT_BUFFER_SECONDS", "4.0"))
+    clip_target_fps: float = float(os.getenv("CLIP_TARGET_FPS", "20.0"))
+
+    # --- Alert Cooldown ---
+    alert_cooldown_seconds: float = float(os.getenv("ALERT_COOLDOWN_SECONDS", "10.0"))
+
+    # --- Telegram Mobile Notifications ---
+    telegram_enabled: bool = os.getenv("TELEGRAM_ENABLED", "true").lower() == "true"
+    telegram_bot_token: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
+    telegram_chat_id: str = os.getenv("TELEGRAM_CHAT_ID", "")
+    default_camera_lat: float = float(os.getenv("DEFAULT_CAMERA_LAT", "9.9252"))
+    default_camera_lng: float = float(os.getenv("DEFAULT_CAMERA_LNG", "78.1198"))
 
     # --- Perspective Restricted Zone (calibrated to floor perspective) ---
     # Calibrated to the floor perimeter matching the camera view:
@@ -149,6 +166,12 @@ class EdgeConfig:
             except Exception:
                 return "cpu"
         return dev
+
+    def get_inference_stride(self) -> int:
+        """Resolve inference stride. If 0 (auto), returns 1 on CUDA GPU and 2 on CPU."""
+        if self.inference_stride > 0:
+            return self.inference_stride
+        return 1 if self.get_yolo_device().startswith("cuda") else 2
 
     def is_half_precision(self) -> bool:
         """Determine if FP16 half-precision is supported and requested (CUDA only)."""

@@ -54,6 +54,9 @@ class AlertEngine:
 
         # Dedup window: (alert_type, key) -> last_alert_time
         self._dedup_window: dict[tuple, float] = {}
+        # Dedup must be at or below the edge-side alert cooldown (10.0s).
+        # Edge enforces 10.0s cooldown per zone; core accepts any alert
+        # that arrives >= 10.0s after the last one for the same zone.
         self._dedup_seconds = 10.0
 
         # Stats
@@ -109,11 +112,17 @@ class AlertEngine:
         return (True, final_severity)
 
     def _build_dedup_key(self, alert_type: str, data: dict) -> tuple:
-        """Build a key for deduplication."""
-        track_id = data.get("track_id", "none")
+        """Build a key for deduplication.
+
+        Dedup is zone-scoped (not track-scoped) so that:
+        - Two different people entering the same zone within 10s don't double-alert.
+        - The SAME person staying inside the zone re-triggers after the 10s edge cooldown
+          because the edge only sends a new alert after its cooldown expires, which
+          is >= self._dedup_seconds.
+        """
         zone_id = data.get("zone_id", "none")
-        breach_type = data.get("breach_type", "none")
-        return (alert_type, str(track_id), str(zone_id), str(breach_type))
+        camera_id = data.get("camera_id", "none")
+        return (alert_type, str(zone_id), str(camera_id))
 
     def _assign_severity(self, alert_type: str, data: dict, default: str) -> str:
         """Assign severity based on rules."""
