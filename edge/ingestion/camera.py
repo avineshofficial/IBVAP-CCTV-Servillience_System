@@ -16,11 +16,17 @@ import logging
 import threading
 from pathlib import Path
 from dataclasses import dataclass
-from typing import Generator, Optional
+from typing import Generator, Optional, Tuple
 import numpy as np
 
 # Suppress verbose DirectShow/MSMF backend warnings on Windows
 os.environ["OPENCV_LOG_LEVEL"] = "ERROR"
+
+# Low-latency FFMPEG capture options for RTSP/network streams (must be set before VideoCapture)
+os.environ.setdefault(
+    "OPENCV_FFMPEG_CAPTURE_OPTIONS",
+    "rtsp_transport;tcp|fflags;nobuffer|flags;low_delay|analyzeduration;0|probesize;32768",
+)
 
 logger = logging.getLogger(__name__)
 
@@ -71,6 +77,9 @@ class CameraStream:
 
         # Live-source (RTSP/webcam) threaded capture state
         self._latest_frame: Optional[np.ndarray] = None
+        self._latest_raw_frame: Optional[np.ndarray] = None
+        self._latest_raw_seq: int = 0
+        self._latest_raw_ts: float = 0.0
         self._frame_lock = threading.Lock()
         self._new_frame_event = threading.Event()
         self._capture_thread: Optional[threading.Thread] = None
@@ -130,7 +139,7 @@ class CameraStream:
                         logger.info(f"[{self.camera_id}] ❌ Index {idx} ({backend_name}) could not be opened.")
                         continue
 
-                    # Configure MJPG format & requested resolution for clean, smooth streaming
+                    # Configure MJPG format & requested resolution for clean, smooth 30 FPS streaming
                     try:
                         cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
                     except Exception:
@@ -138,8 +147,8 @@ class CameraStream:
                     try:
                         cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
                         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
-                        cap.set(cv2.CAP_PROP_FPS, self.target_fps)
-                        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # Minimal buffer for real-time low-latency CPU grabber
+                        cap.set(cv2.CAP_PROP_FPS, max(30, int(self.target_fps)))
+                        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # Minimal buffer for zero-lag latest-frame capture
                     except Exception:
                         pass
 
@@ -286,7 +295,10 @@ class CameraStream:
                 continue
 
             try:
-                ret, frame = self._cap.read()
+                if not self._cap.grab():
+                    ret, frame = False, None
+                else:
+                    ret, frame = self._cap.retrieve()
             except Exception as e:
                 logger.warning(f"[{self.camera_id}] Frame read exception: {e}. Reconnecting...")
                 if self._cap is not None:
@@ -309,8 +321,12 @@ class CameraStream:
                 time.sleep(0.5)
                 continue
 
+            now_mono = time.monotonic()
             with self._frame_lock:
                 self._latest_frame = frame
+                self._latest_raw_frame = frame
+                self._latest_raw_seq += 1
+                self._latest_raw_ts = now_mono
                 self._new_frame_event.set()
 
     def _frames_from_live_source(self, frame_interval: float) -> Generator[FramePacket, None, None]:
@@ -355,6 +371,11 @@ class CameraStream:
 
             self._frame_count += 1
             last_frame_time = time.time()
+            now_mono = time.monotonic()
+            with self._frame_lock:
+                self._latest_raw_frame = frame
+                self._latest_raw_seq += 1
+                self._latest_raw_ts = now_mono
             yield self._make_packet(frame)
 
     def frames(self) -> Generator[FramePacket, None, None]:
@@ -397,6 +418,18 @@ class CameraStream:
             yield from self._frames_from_file(frame_interval)
         else:
             yield from self._frames_from_live_source(frame_interval)
+
+    def get_latest_raw_frame(self) -> Optional[Tuple[int, float, np.ndarray]]:
+        """Non-blocking read of the freshest captured raw frame (seq, monotonic_ts, frame).
+
+        Does NOT clear or steal frames from the inference generator `frames()`,
+        allowing a dedicated live-stream renderer thread to run at a steady 25+ FPS
+        independently of AI inference latency.
+        """
+        with self._frame_lock:
+            if self._latest_raw_frame is None:
+                return None
+            return (self._latest_raw_seq, self._latest_raw_ts, self._latest_raw_frame)
 
     def release(self):
         """Release camera and capture thread resources."""

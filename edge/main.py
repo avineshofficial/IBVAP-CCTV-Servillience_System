@@ -13,6 +13,7 @@ import json
 import logging
 import asyncio
 import collections
+import threading
 import numpy as np
 import signal
 from pathlib import Path
@@ -116,8 +117,9 @@ class EdgePipeline:
 
         # ── Incident Clip Recording (Strict 8s: 4s Pre + 4s Post) ──
         # Pre-event ring buffer: stores (monotonic_timestamp, frame) tuples.
-        # Continuously pruned to hold exactly the last PRE_ALERT_BUFFER_SECONDS (4.0s)
-        # of annotated frames at full inference FPS (every frame, not subsampled).
+        # Protected by _clip_buf_lock so the smooth 20 FPS stream thread can feed
+        # evenly-paced frames without blocking AI inference.
+        self._clip_buf_lock = threading.Lock()
         self._pre_event_buffer: collections.deque = collections.deque()
         # Active clip recorder state (at most ONE active capture at a time)
         self._clip_recorder = None  # dict or None
@@ -136,6 +138,31 @@ class EdgePipeline:
         self._breach_face_scanned: set[int] = set()
         self._breach_anpr_scanned: set[int] = set()
         self._sync_in_progress = False
+
+        # Decoupled 25 FPS live-stream preview state (thread-safe cache updated by AI loop)
+        self._stream_state_lock = threading.Lock()
+        self._stream_prev_boxes: dict[int, tuple[float, float, float]] = {}  # track_id -> (cx, cy, mono_ts)
+        self._stream_overlay_state: dict[str, Any] = {
+            "seq": 0,
+            "capture_mono": 0.0,
+            "updated_mono": 0.0,
+            "tracks": [],
+            "zones": [],
+            "breached_zone_ids": set(),
+            "breached_track_ids": set(),
+            "has_active_breach": False,
+            "avg_fps": 0.0,
+            "tracks_active": 0,
+            "clip_lock": False,
+            "zone_cooldown_until": {},
+        }
+        self._live_stream_thread: Optional[threading.Thread] = None
+        # Non-blocking 1-slot WebSocket ingest queue (network I/O never stalls stream thread)
+        self._ws_send_lock = threading.Lock()
+        self._ws_send_event = threading.Event()
+        self._ws_pending_jpeg: Optional[bytes] = None
+        self._ws_connected: bool = False
+        self._ws_sender_thread: Optional[threading.Thread] = None
 
         # Background CPU ThreadPoolExecutor for asynchronous non-blocking I/O
         # (clip encoding, disk thumbnail writing, live frame streaming, core uplink sync, and Telegram alerts)
@@ -169,7 +196,7 @@ class EdgePipeline:
             height=self.config.frame_height,
         )
 
-        # Tracker (YOLO26 detection + ByteTrack with RTX 3050 CUDA / FP16 acceleration & Stride Optimization)
+        # Tracker (YOLO26 detection + ByteTrack with RTX 3050 CUDA acceleration)
         self.tracker = Tracker(
             model_name=self.config.get_yolo_model_path(),
             tracker_config=self.config.tracker_type,
@@ -180,6 +207,8 @@ class EdgePipeline:
             imgsz=self.config.yolo_imgsz,
             stride=self.config.get_inference_stride(),
         )
+        # Pre-load & warm up YOLO26 model on GPU during startup (zero first-frame stall)
+        self.tracker.initialize()
 
         # Virtual Fence
         self.fence_engine = VirtualFenceEngine()
@@ -374,8 +403,9 @@ class EdgePipeline:
     def _prune_pre_event_buffer(self):
         """Remove frames older than PRE_ALERT_BUFFER_SECONDS from the pre-event ring buffer."""
         cutoff = time.monotonic() - self.config.pre_alert_buffer_seconds
-        while self._pre_event_buffer and self._pre_event_buffer[0][0] < cutoff:
-            self._pre_event_buffer.popleft()
+        with self._clip_buf_lock:
+            while self._pre_event_buffer and self._pre_event_buffer[0][0] < cutoff:
+                self._pre_event_buffer.popleft()
 
     def _start_clip_capture(
         self,
@@ -391,53 +421,54 @@ class EdgePipeline:
         Returns the clip URL path, or "" on failure.
         """
         try:
-            if self._clip_lock:
-                # Capture already in progress — return existing clip URL
-                if self._clip_recorder:
-                    return self._clip_recorder["clip_url"]
-                return ""
+            with self._clip_buf_lock:
+                if self._clip_lock:
+                    # Capture already in progress — return existing clip URL
+                    if self._clip_recorder:
+                        return self._clip_recorder["clip_url"]
+                    return ""
 
-            now_mono = time.monotonic()
-            now_wall = time.time()
+                now_mono = time.monotonic()
+                now_wall = time.time()
 
-            clips_dir = self.config.media_dir / "clips"
-            clips_dir.mkdir(parents=True, exist_ok=True)
-            ts = int(now_wall)
-            filename = f"incident_{camera_id}_trk{track_id}_{ts}.mp4"
-            out_path = clips_dir / filename
-            clip_url = f"/media/clips/{filename}"
+                clips_dir = self.config.media_dir / "clips"
+                clips_dir.mkdir(parents=True, exist_ok=True)
+                ts = int(now_wall)
+                filename = f"incident_{camera_id}_trk{track_id}_{ts}.mp4"
+                out_path = clips_dir / filename
+                clip_url = f"/media/clips/{filename}"
 
-            # 1. Snapshot the pre-event buffer (up to 4.0s of recent frames)
-            pre_frames = [(t, f.copy()) for t, f in self._pre_event_buffer]
-            if pre_frames:
-                actual_pre_duration = now_mono - pre_frames[0][0]
-            else:
-                actual_pre_duration = 0.0
+                # 1. Snapshot the smooth 20 FPS pre-event buffer (up to 4.0s of recent frames)
+                pre_frames = [(t, f.copy()) for t, f in self._pre_event_buffer]
+                if pre_frames:
+                    actual_pre_duration = now_mono - pre_frames[0][0]
+                else:
+                    actual_pre_duration = 0.0
 
-            # 2. Dynamic window compensation: if pre-buffer is short, extend post capture
-            total_target = self.config.clip_duration_seconds  # 8.0
-            post_duration = max(
-                self.config.post_alert_buffer_seconds,
-                total_target - actual_pre_duration,
-            )
+                # 2. Dynamic window compensation: if pre-buffer is short, extend post capture
+                total_target = self.config.clip_duration_seconds  # 8.0
+                post_duration = max(
+                    self.config.post_alert_buffer_seconds,
+                    total_target - actual_pre_duration,
+                )
 
-            self._clip_lock = True
-            self._clip_recorder = {
-                "camera_id": camera_id,
-                "track_id": track_id,
-                "filename": filename,
-                "out_path": out_path,
-                "clip_url": clip_url,
-                "pre_frames": pre_frames,
-                "post_frames": [],
-                "trigger_mono": now_mono,
-                "stop_mono": now_mono + post_duration,
-                "total_target": total_target,
-                "actual_pre_duration": actual_pre_duration,
-                "alert_data": alert_data or {},
-                "severity": severity,
-                "message": message,
-            }
+                self._clip_lock = True
+                self._clip_recorder = {
+                    "camera_id": camera_id,
+                    "track_id": track_id,
+                    "filename": filename,
+                    "out_path": out_path,
+                    "clip_url": clip_url,
+                    "pre_frames": pre_frames,
+                    "post_frames": [],
+                    "trigger_mono": now_mono,
+                    "stop_mono": now_mono + post_duration,
+                    "total_target": total_target,
+                    "actual_pre_duration": actual_pre_duration,
+                    "alert_data": alert_data or {},
+                    "severity": severity,
+                    "message": message,
+                }
             logger.info(
                 f"[INCIDENT CAPTURE STARTED] Pre-buffer: {len(pre_frames)} frames ({actual_pre_duration:.1f}s). "
                 f"Post capture: {post_duration:.1f}s. Total target: {total_target:.1f}s. "
@@ -446,31 +477,36 @@ class EdgePipeline:
             return clip_url
         except Exception as e:
             logger.warning(f"Failed to start incident clip capture: {e}")
-            self._clip_lock = False
-            self._clip_recorder = None
+            with self._clip_buf_lock:
+                self._clip_lock = False
+                self._clip_recorder = None
             return ""
 
-    def _feed_clip_recorder(self, frame: np.ndarray):
-        """Append the current annotated frame to the active clip recorder if one is running."""
-        if not self._clip_recorder:
-            return
+    def _feed_clip_recorder(self, frame: np.ndarray, frame_mono: Optional[float] = None):
+        """Append the current smooth rendered frame to the active clip recorder if one is running."""
+        should_finalize = False
+        now_mono = frame_mono if frame_mono is not None else time.monotonic()
+        with self._clip_buf_lock:
+            if not self._clip_recorder:
+                return
+            self._clip_recorder["post_frames"].append((now_mono, frame.copy()))
+            if now_mono >= self._clip_recorder["stop_mono"]:
+                should_finalize = True
 
-        now_mono = time.monotonic()
-        self._clip_recorder["post_frames"].append((now_mono, frame.copy()))
-
-        # Check if post-capture window has elapsed
-        if now_mono >= self._clip_recorder["stop_mono"]:
+        if should_finalize:
             self._finalize_clip()
 
     def _finalize_clip(self):
         """Finalize the current clip recorder: merge pre + post frames and encode to MP4."""
-        rec = self._clip_recorder
-        if rec is None:
-            return
+        with self._clip_buf_lock:
+            rec = self._clip_recorder
+            if rec is None:
+                return
+            self._clip_recorder = None
+            self._clip_lock = False
 
-        # Merge pre + post frames
+        # Merge pre + post frames WITH their exact monotonic timestamps for smooth 1.0x pacing
         all_frames_ts = rec["pre_frames"] + rec["post_frames"]
-        all_frames = [f for _, f in all_frames_ts]
 
         out_path = rec["out_path"]
         total_target = rec["total_target"]
@@ -480,11 +516,8 @@ class EdgePipeline:
         message = rec.get("message", "")
         telegram_enabled = self.config.telegram_enabled
 
-        self._clip_recorder = None
-        self._clip_lock = False
-
         logger.info(
-            f"[INCIDENT CAPTURE COMPLETE] Collected {len(all_frames)} raw frames. "
+            f"[INCIDENT CAPTURE COMPLETE] Collected {len(all_frames_ts)} smooth frames. "
             f"Encoding {total_target:.1f}s MP4 at {clip_target_fps} FPS → {rec['filename']}"
         )
 
@@ -492,7 +525,7 @@ class EdgePipeline:
         self._io_executor.submit(
             self._encode_strict_8s_clip,
             out_path,
-            all_frames,
+            all_frames_ts,
             total_target,
             clip_target_fps,
             alert_data,
@@ -513,47 +546,69 @@ class EdgePipeline:
         telegram_enabled: bool = False,
     ):
         """
-        Encode raw_frames into standard HTML5 browser-playable video files (both H.264 MP4 and VP8 WebM)
-        with strictly target_duration seconds of playback.
+        Encode captured (timestamp, frame) pairs into a smooth, universal HTML5 & Telegram
+        H.264 MP4 (Baseline 3.1, yuv420p, 1s keyframe GOP, +faststart, ~350-550 KB).
 
-        Resamples raw_frames to exactly (target_fps * target_duration) output frames
-        by nearest-neighbor index mapping across the input timeline.
-        Outputs:
-          1. .mp4: Standard H.264 (yuv420p) via PyAV (plays natively in Chrome, Edge, Safari, Firefox)
-          2. .webm: Standard VP8 via PyAV / OpenCV (preferred HTML5 web format)
-        Result: exactly 8.0s playback in any browser player.
-
-        Automatically dispatches 8s video evidence to Telegram when encoding completes.
+        Uses true monotonic timestamp resampling (bisect) so playback speed is exact 1.0x
+        real-time without slow-mo/fast-forward jitter, and 1-second keyframe intervals
+        so both Telegram mobile and Chrome/Edge play & seek immediately without lag.
         """
         try:
             if not raw_frames:
                 logger.warning("No frames to encode for incident clip")
                 return
 
+            import bisect
+            from fractions import Fraction
+
             out_path.parent.mkdir(parents=True, exist_ok=True)
 
-            h, w = raw_frames[0].shape[:2]
-            # Fast mobile resolution for rapid encoding and transfer (max 960px width, even dimensions)
-            if w > 960:
-                target_w = 960
-                target_h = int(h * (960 / w))
+            # Support both (monotonic_ts, frame) tuples and legacy plain frame lists
+            if isinstance(raw_frames[0], tuple) and len(raw_frames[0]) == 2:
+                timestamps = [float(item[0]) for item in raw_frames]
+                frames_only = [item[1] for item in raw_frames]
+            else:
+                frames_only = raw_frames
+                timestamps = [float(i) for i in range(len(raw_frames))]
+
+            h, w = frames_only[0].shape[:2]
+            # Crisp 480p/540p resolution for fast encode, small Telegram size, and sharp faces
+            if w > 854:
+                target_w = 854
+                target_h = int(h * (854 / float(w)))
             else:
                 target_w = w
                 target_h = h
-            target_w = target_w - (target_w % 2)
-            target_h = target_h - (target_h % 2)
+            target_w = max(2, target_w - (target_w % 2))
+            target_h = max(2, target_h - (target_h % 2))
 
-            total_output_frames = int(target_fps * target_duration)  # e.g. 20 * 8 = 160
-            n_input = len(raw_frames)
+            fps_int = max(1, int(round(target_fps)))
+            total_output_frames = int(fps_int * target_duration)  # e.g. 20 * 8 = 160
+            n_input = len(frames_only)
 
-            # Resample: map each output frame index to the nearest input frame index
-            indices = [int(i * n_input / total_output_frames) for i in range(total_output_frames)]
-            indices = [min(idx, n_input - 1) for idx in indices]
+            # Timestamp-accurate nearest-frame resampling (preserves real-time 1.0x motion)
+            t_start = timestamps[0]
+            t_end = timestamps[-1]
+            span = t_end - t_start
+            indices = []
+            if span > 0.05 and n_input > 1:
+                for i in range(total_output_frames):
+                    target_t = t_start + (i / float(max(1, total_output_frames - 1))) * span
+                    pos = bisect.bisect_left(timestamps, target_t)
+                    if pos <= 0:
+                        idx = 0
+                    elif pos >= n_input:
+                        idx = n_input - 1
+                    else:
+                        idx = pos if (timestamps[pos] - target_t) < (target_t - timestamps[pos - 1]) else (pos - 1)
+                    indices.append(idx)
+            else:
+                indices = [min(int(i * n_input / total_output_frames), n_input - 1) for i in range(total_output_frames)]
 
             # Prepare resampled frames, guaranteeing consistent dimensions
             resampled_frames = []
             for idx in indices:
-                f = raw_frames[idx]
+                f = frames_only[idx]
                 if f.shape[:2] != (target_h, target_w):
                     f = cv2.resize(f, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
                 resampled_frames.append(f)
@@ -561,23 +616,34 @@ class EdgePipeline:
             mp4_path = out_path.with_suffix(".mp4")
             tmp_mp4_path = mp4_path.with_name(f"{mp4_path.stem}.tmp.mp4")
 
-            # ── 1. Fast Encode Browser-Native H.264 MP4 (Universal HTML5/Telegram playback) ──
+            # ── 1. Smooth Browser + Telegram Native H.264 MP4 (Baseline 3.1, 1s GOP, +faststart) ──
             mp4_success = False
             try:
                 import av
                 container_mp4 = av.open(str(tmp_mp4_path), mode="w", options={"movflags": "+faststart"})
-                stream_mp4 = container_mp4.add_stream("libx264", rate=int(target_fps))
+                stream_mp4 = container_mp4.add_stream("libx264", rate=fps_int)
                 stream_mp4.width = target_w
                 stream_mp4.height = target_h
                 stream_mp4.pix_fmt = "yuv420p"
+                stream_mp4.time_base = Fraction(1, fps_int)
+                stream_mp4.gop_size = fps_int          # 1 keyframe every 1.0s (instant seek/play)
+                stream_mp4.max_b_frames = 0            # Zero B-frame reorder delay on mobile/Telegram
                 stream_mp4.options = {
-                    "crf": "28",
-                    "preset": "ultrafast",
-                    "tune": "zerolatency",
+                    "profile": "baseline",
+                    "level": "3.1",
+                    "preset": "veryfast",
+                    "crf": "25",
+                    "maxrate": "750k",
+                    "bufsize": "1500k",
+                    "g": str(fps_int),
+                    "keyint_min": str(fps_int),
+                    "sc_threshold": "0",
                     "threads": "2",
                 }
-                for f in resampled_frames:
+                for frame_idx, f in enumerate(resampled_frames):
                     av_frame = av.VideoFrame.from_ndarray(f, format="bgr24")
+                    av_frame.pts = frame_idx
+                    av_frame.time_base = Fraction(1, fps_int)
                     for packet in stream_mp4.encode(av_frame):
                         container_mp4.mux(packet)
                 for packet in stream_mp4.encode():
@@ -589,7 +655,7 @@ class EdgePipeline:
                 logger.warning(f"PyAV H.264 encode unavailable ({e_av}), falling back to OpenCV mp4v")
                 try:
                     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-                    writer = cv2.VideoWriter(str(tmp_mp4_path), fourcc, target_fps, (target_w, target_h))
+                    writer = cv2.VideoWriter(str(tmp_mp4_path), fourcc, float(fps_int), (target_w, target_h))
                     for f in resampled_frames:
                         writer.write(f)
                     writer.release()
@@ -603,10 +669,10 @@ class EdgePipeline:
                         except Exception:
                             pass
 
-            actual_duration = total_output_frames / target_fps
+            actual_duration = total_output_frames / float(fps_int)
             logger.info(
                 f"[EVIDENCE SAVED] {mp4_path.name} (H.264: {mp4_success}): "
-                f"{total_output_frames} frames @ {target_fps} FPS = {actual_duration:.1f}s playback ({mp4_path.stat().st_size / 1024:.0f} KB)"
+                f"{total_output_frames} frames ({n_input} captured) @ {fps_int} FPS = {actual_duration:.1f}s playback ({mp4_path.stat().st_size / 1024:.0f} KB)"
             )
 
             # ── 2. FACE EXTRACTION + TELEGRAM: Extract faces then send single alert ──
@@ -895,6 +961,427 @@ class EdgePipeline:
 
         return overlay
 
+    def _update_stream_overlay_state(self, tracks, fence_zones, breaches, capture_mono: float):
+        """Snapshot lightweight AI overlay metadata (with damped bbox velocity) for live preview.
+
+        Runs in <0.05ms so the AI inference loop never blocks on stream rendering or JPEG encoding.
+        """
+        new_prev: dict[int, tuple[float, float, float]] = {}
+        tracks_snapshot = []
+        for t in tracks:
+            if not (t.bbox and len(t.bbox) == 4):
+                continue
+            bx1, by1, bx2, by2 = float(t.bbox[0]), float(t.bbox[1]), float(t.bbox[2]), float(t.bbox[3])
+            cx = (bx1 + bx2) * 0.5
+            cy = (by1 + by2) * 0.5
+            vx, vy = 0.0, 0.0
+            prev = self._stream_prev_boxes.get(t.track_id)
+            if prev is not None:
+                dt = capture_mono - prev[2]
+                if 0.01 <= dt <= 0.6:
+                    # Clamp max velocity (px/s) to prevent jump artifacts
+                    vx = max(-600.0, min(600.0, (cx - prev[0]) / dt))
+                    vy = max(-450.0, min(450.0, (cy - prev[1]) / dt))
+            new_prev[t.track_id] = (cx, cy, capture_mono)
+            tracks_snapshot.append(
+                (
+                    t.track_id,
+                    t.class_name,
+                    (bx1, by1, bx2, by2),
+                    float(t.confidence),
+                    (float(t.ground_point[0]), float(t.ground_point[1])),
+                    list(t.ground_point_history[-30:]),
+                    (vx, vy),
+                )
+            )
+        self._stream_prev_boxes = new_prev
+
+        zones_snapshot = [
+            (
+                z.zone_id,
+                z.name,
+                z.rule_type.value,
+                float(getattr(z, "dwell_threshold", 30.0) or 30.0),
+                list(z.polygon_points_pixel),
+            )
+            for z in fence_zones
+            if z.is_active and len(z.polygon_points_pixel) >= 3
+        ]
+        breached_zone_ids = {b.zone_id for b in breaches}
+        breached_track_ids = set(self._breached_track_ids)
+        cooldowns = dict(self._zone_cooldown_until)
+
+        now_updated = time.monotonic()
+        with self._stream_state_lock:
+            self._stream_overlay_state = {
+                "seq": self._stream_overlay_state["seq"] + 1,
+                "capture_mono": capture_mono,
+                "updated_mono": now_updated,
+                "tracks": tracks_snapshot,
+                "zones": zones_snapshot,
+                "breached_zone_ids": breached_zone_ids,
+                "breached_track_ids": breached_track_ids,
+                "has_active_breach": len(breached_track_ids) > 0,
+                "avg_fps": float(self._stats.get("avg_fps", 0.0)),
+                "tracks_active": int(self._stats.get("tracks_active", 0)),
+                "clip_lock": bool(getattr(self, "_clip_lock", False)),
+                "zone_cooldown_until": cooldowns,
+            }
+
+    def _render_live_preview(
+        self,
+        raw_frame: np.ndarray,
+        raw_ts: float,
+        state: dict,
+        stream_fps: float,
+    ) -> np.ndarray:
+        """Render cached AI overlays onto a geometry-matched (854x480) live preview frame.
+
+        Always matches the exact aspect ratio of (frame_width, frame_height) so bounding
+        boxes align 1:1 with YOLO geometry, and applies short-horizon damped velocity
+        prediction + staleness expiry so boxes stay locked onto moving objects.
+        """
+        # Exact target preview geometry locked to inference frame aspect ratio (e.g. 1280x720 -> 854x480)
+        fw = float(self.config.frame_width)
+        fh = float(self.config.frame_height)
+        pw = min(854, int(self.config.frame_width))
+        pw = max(2, pw - (pw % 2))
+        ph = int(round(pw * (fh / fw)))
+        ph = max(2, ph - (ph % 2))
+
+        rh, rw = raw_frame.shape[:2]
+        if rw != pw or rh != ph:
+            preview = cv2.resize(raw_frame, (pw, ph), interpolation=cv2.INTER_LINEAR)
+        else:
+            preview = raw_frame.copy()
+
+        sx = pw / fw
+        sy = ph / fh
+
+        zones = state["zones"]
+        tracks = state["tracks"]
+        breached_zone_ids = state["breached_zone_ids"]
+        breached_track_ids = state["breached_track_ids"]
+        capture_mono = float(state.get("capture_mono", 0.0))
+        updated_mono = float(state.get("updated_mono", capture_mono))
+        now_draw = time.monotonic()
+        # Check freshness against AI completion time (`updated_mono`), NEVER hiding freshly-detected
+        # boxes when CPU inference takes >0.75s. Only expire after 2.5s of complete AI silence.
+        boxes_fresh = (updated_mono > 0.0) and ((now_draw - updated_mono) <= 2.5)
+        box_age = max(0.0, raw_ts - capture_mono) if capture_mono > 0 else 0.0
+        # Gentle damped short-horizon motion prediction (clamped <=0.18s)
+        pred_dt = min(box_age, 0.18) * 0.55 if boxes_fresh else 0.0
+        has_active_breach = state["has_active_breach"] and boxes_fresh
+
+        # 1. Draw Virtual Fence Zones
+        for zone_id, zone_name, rule_val, dwell_thr, poly_pts in zones:
+            pts = np.array([(int(p[0] * sx), int(p[1] * sy)) for p in poly_pts], dtype=np.int32)
+            if len(pts) < 3:
+                continue
+            zone_breached = (boxes_fresh and (zone_id in breached_zone_ids)) or (
+                has_active_breach and (zone_id == "zone_restricted_area" or rule_val == "exclusion")
+            )
+            if rule_val == "exclusion":
+                bx, by, bw, bh = cv2.boundingRect(pts)
+                bx2r, by2r = min(bx + bw, pw), min(by + bh, ph)
+                bx, by = max(bx, 0), max(by, 0)
+                if bw > 0 and bh > 0 and bx2r > bx and by2r > by:
+                    roi = preview[by:by2r, bx:bx2r]
+                    tint = roi.copy()
+                    pts_shifted = pts - np.array([bx, by])
+                    tint_color = (0, 0, 240) if zone_breached else (0, 0, 160)
+                    cv2.fillPoly(tint, [pts_shifted], tint_color)
+                    alpha = 0.18 if zone_breached else 0.10
+                    cv2.addWeighted(tint, alpha, roi, 1.0 - alpha, 0, dst=roi)
+                border_color = (0, 0, 255) if zone_breached else (0, 0, 180)
+                cv2.polylines(preview, [pts], True, border_color, 2 if zone_breached else 1, cv2.LINE_AA)
+                for pt in pts:
+                    cv2.circle(preview, tuple(pt), 2, border_color, -1, cv2.LINE_AA)
+            elif rule_val == "dwell":
+                color = (0, 200, 255)
+                cv2.polylines(preview, [pts], True, color, 2)
+                lx, ly = int(pts[0][0]) + 6, int(pts[0][1]) + 16
+                cv2.putText(
+                    preview,
+                    f"[DWELL] {zone_name.upper()} ({int(dwell_thr)}s)",
+                    (lx, ly),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.38,
+                    color,
+                    1,
+                    cv2.LINE_AA,
+                )
+
+        # 2. Draw Velocity-Aligned Target Bounding Boxes & Trajectories
+        if boxes_fresh:
+            for track_id, class_name, bbox, conf, ground_pt, history, vel in tracks:
+                dx = vel[0] * pred_dt
+                dy = vel[1] * pred_dt
+                bx1 = max(0.0, min(fw - 2.0, bbox[0] + dx))
+                by1 = max(0.0, min(fh - 2.0, bbox[1] + dy))
+                bx2 = max(bx1 + 4.0, min(fw, bbox[2] + dx))
+                by2 = max(by1 + 4.0, min(fh, bbox[3] + dy))
+
+                x1, y1, x2, y2 = int(bx1 * sx), int(by1 * sy), int(bx2 * sx), int(by2 * sy)
+                bw, bh = max(8, x2 - x1), max(8, y2 - y1)
+                is_breached = track_id in breached_track_ids
+
+                if is_breached:
+                    box_color = (0, 0, 255)
+                elif class_name == "person":
+                    box_color = (0, 220, 255)
+                else:
+                    box_color = (255, 180, 0)
+
+                cv2.rectangle(preview, (x1, y1), (x2, y2), box_color, 2 if is_breached else 1)
+
+                corner_len = min(12, bw // 4, bh // 4)
+                cv2.line(preview, (x1, y1), (x1 + corner_len, y1), (255, 255, 255), 2)
+                cv2.line(preview, (x1, y1), (x1, y1 + corner_len), (255, 255, 255), 2)
+                cv2.line(preview, (x2, y2), (x2 - corner_len, y2), (255, 255, 255), 2)
+                cv2.line(preview, (x2, y2), (x2, y2 - corner_len), (255, 255, 255), 2)
+
+                if is_breached:
+                    label_text = f"[INTRUDER] #{track_id} {class_name.upper()} | {conf:.0%}"
+                    bg_color = (0, 0, 220)
+                    text_color = (255, 255, 255)
+                else:
+                    label_text = f"#{track_id} {class_name.upper()} ({int(conf * 100)}%)"
+                    bg_color = box_color
+                    text_color = (0, 0, 0)
+
+                (tw, th), _ = cv2.getTextSize(label_text, cv2.FONT_HERSHEY_SIMPLEX, 0.38, 1)
+                ly1 = max(th + 8, y1)
+                cv2.rectangle(preview, (x1, ly1 - th - 8), (x1 + tw + 6, ly1), bg_color, -1)
+                cv2.putText(preview, label_text, (x1 + 3, ly1 - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.38, text_color, 1, cv2.LINE_AA)
+
+                gx = int(max(0.0, min(fw, ground_pt[0] + dx)) * sx)
+                gy = int(max(0.0, min(fh, ground_pt[1] + dy)) * sy)
+                if is_breached:
+                    cv2.circle(preview, (gx, gy), 7, (0, 0, 255), 2)
+                    cv2.circle(preview, (gx, gy), 3, (0, 0, 255), -1)
+                else:
+                    cv2.circle(preview, (gx, gy), 4, (0, 255, 0), -1)
+
+                if len(history) > 1:
+                    trail_color = (0, 0, 255) if is_breached else box_color
+                    pts_trail = np.array([(int(p[0] * sx), int(p[1] * sy)) for p in history], np.int32)
+                    cv2.polylines(preview, [pts_trail], False, trail_color, 2 if is_breached else 1)
+
+        # 3. Breach Banner & Live Cooldown
+        now_mono = time.monotonic()
+        cooldowns = state["zone_cooldown_until"]
+        cd_rem = max([0.0] + [until - now_mono for until in cooldowns.values()])
+
+        if has_active_breach:
+            pulse = int(time.time() * 5) % 2 == 0
+            banner_bg = (0, 0, 230) if pulse else (0, 0, 160)
+            cv2.rectangle(preview, (0, 0), (pw, 30), banner_bg, -1)
+            cv2.line(preview, (0, 30), (pw, 30), (255, 255, 255), 1)
+            if cd_rem > 0:
+                breach_msg = f"[ALERT SIGNAL] RESTRICTED BORDER BREACHED! | COOLDOWN: {cd_rem:.1f}s"
+            else:
+                breach_msg = "[ALERT SIGNAL] RESTRICTED BORDER PERIMETER BREACHED! INTRUSION DETECTED"
+            (tw, th), _ = cv2.getTextSize(breach_msg, cv2.FONT_HERSHEY_SIMPLEX, 0.44, 1)
+            cv2.putText(preview, breach_msg, (max(8, (pw - tw) // 2), 20), cv2.FONT_HERSHEY_SIMPLEX, 0.44, (255, 255, 255), 1, cv2.LINE_AA)
+
+        # 4. Compact Status Pill
+        display_fps = stream_fps if stream_fps > 0 else state["avg_fps"]
+        active_cnt = state["tracks_active"] if boxes_fresh else 0
+        stats_text = f"CAM-01 | {display_fps:.1f} FPS | {active_cnt} TARGET{'S' if active_cnt != 1 else ''}"
+        (tw, th), _ = cv2.getTextSize(stats_text, cv2.FONT_HERSHEY_SIMPLEX, 0.40, 1)
+        pill_right = 20 + tw
+        pill_top = 36 if has_active_breach else 10
+        cv2.rectangle(preview, (10, pill_top), (pill_right, pill_top + th + 10), (15, 20, 25), -1)
+        cv2.rectangle(preview, (10, pill_top), (pill_right, pill_top + th + 10), (0, 255, 200), 1)
+        cv2.putText(preview, stats_text, (15, pill_top + th + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.40, (0, 255, 200), 1, cv2.LINE_AA)
+
+        if not has_active_breach and cd_rem > 0:
+            cd_text = f"COOLDOWN: {cd_rem:.1f}s"
+            (cw, ch), _ = cv2.getTextSize(cd_text, cv2.FONT_HERSHEY_SIMPLEX, 0.40, 1)
+            cv2.rectangle(preview, (pill_right + 6, pill_top), (pill_right + 16 + cw, pill_top + ch + 10), (25, 20, 10), -1)
+            cv2.rectangle(preview, (pill_right + 6, pill_top), (pill_right + 16 + cw, pill_top + ch + 10), (0, 180, 255), 1)
+            cv2.putText(preview, cd_text, (pill_right + 11, pill_top + ch + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.40, (0, 180, 255), 1, cv2.LINE_AA)
+
+        if state["clip_lock"]:
+            rec_y = pill_top + 10
+            if int(time.time() * 2) % 2 == 0:
+                cv2.circle(preview, (pw - 64, rec_y), 5, (0, 0, 255), -1)
+            cv2.putText(preview, "REC [8s]", (pw - 54, rec_y + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (0, 0, 255), 1, cv2.LINE_AA)
+
+        return preview
+
+    def _ws_sender_loop(self, ws_ingest_url: str):
+        """Dedicated non-blocking 1-slot binary WebSocket sender to Core RAM hub.
+
+        Uses `with ws_connect(...) as ws_conn:` cleanly (zero DeprecationWarning) and
+        runs independently of `_live_stream_loop` so reconnects or slow sockets NEVER
+        stall the 25 FPS frame renderer.
+        """
+        try:
+            from websockets.sync.client import connect as ws_connect
+        except Exception:
+            self._ws_connected = False
+            return
+
+        while self._running:
+            # Wait until at least one frame is ready before connecting
+            if not self._ws_send_event.wait(timeout=0.5):
+                continue
+
+            try:
+                with ws_connect(
+                    ws_ingest_url,
+                    compression=None,
+                    additional_headers={"X-Edge-API-Key": self.config.edge_api_key},
+                    open_timeout=1.0,
+                    close_timeout=0.3,
+                ) as ws_conn:
+                    self._ws_connected = True
+                    logger.info(f"[LiveStream] Connected to Core WS ingest: {ws_ingest_url}")
+
+                    while self._running:
+                        with self._ws_send_lock:
+                            self._ws_send_event.clear()
+                            jpeg_bytes = self._ws_pending_jpeg
+                            self._ws_pending_jpeg = None
+
+                        if jpeg_bytes:
+                            ws_conn.send(jpeg_bytes)
+                            continue
+
+                        if not self._ws_send_event.wait(timeout=0.5):
+                            continue
+            except Exception:
+                self._ws_connected = False
+                if self._running:
+                    time.sleep(1.5)
+            finally:
+                self._ws_connected = False
+
+    def _live_stream_loop(self):
+        """Dedicated 25 FPS live stream renderer, encoder & smooth incident clip feeder.
+
+        Completely decoupled from AI inference AND network I/O: continuously draws
+        velocity-aligned bounding boxes/virtual fence onto the freshest camera frame
+        (854x480), feeds the smooth 20+ FPS pre-event buffer & active 8s clip recorder,
+        encodes once as JPEG Q=68 (~25-45 KB), and hands off bytes non-blockingly to
+        the WS sender thread (with automatic disk fallback).
+        """
+        target_fps = max(20.0, float(self.config.camera_fps))
+        interval = 1.0 / target_fps
+        jpeg_quality = 68
+        camera_id = self.camera.camera_id
+        # Force IPv4 127.0.0.1 instead of localhost to avoid Windows IPv6 ::1 1-second connect hangs
+        ws_base = (
+            self.config.core_api_url.rstrip("/")
+            .replace("https://", "wss://")
+            .replace("http://", "ws://")
+            .replace("://localhost:", "://127.0.0.1:")
+            .replace("://localhost/", "://127.0.0.1/")
+        )
+        if ws_base.endswith("://localhost"):
+            ws_base = ws_base[:-len("://localhost")] + "://127.0.0.1"
+        ws_ingest_url = f"{ws_base}/api/v1/cameras/{camera_id}/ingest"
+
+        # Launch dedicated non-blocking WS sender thread so network I/O never stalls rendering
+        self._ws_sender_thread = threading.Thread(
+            target=self._ws_sender_loop, args=(ws_ingest_url,), daemon=True, name="ibvap_ws_sender"
+        )
+        self._ws_sender_thread.start()
+
+        last_raw_seq = 0
+        last_meta_seq = -1
+        last_disk_write = 0.0
+        win_frames = 0
+        win_bytes = 0
+        win_start: Optional[float] = None
+        current_stream_fps = 0.0
+
+        logger.info(
+            f"[LiveStream] Dedicated stream + clip-buffer thread started "
+            f"(target {target_fps:.0f} FPS, 854x480, JPEG Q={jpeg_quality})"
+        )
+
+        while self._running:
+            loop_start = time.monotonic()
+
+            latest = self.camera.get_latest_raw_frame()
+            if latest is None:
+                time.sleep(0.01)
+                continue
+
+            if win_start is None:
+                win_start = loop_start
+
+            raw_seq, raw_ts, raw_frame = latest
+            with self._stream_state_lock:
+                state = self._stream_overlay_state
+                meta_seq = state["seq"]
+
+            # Avoid encoding duplicate frames when neither camera nor AI state changed
+            if raw_seq == last_raw_seq and meta_seq == last_meta_seq:
+                time.sleep(0.004)
+                continue
+
+            last_raw_seq = raw_seq
+            last_meta_seq = meta_seq
+
+            try:
+                preview = self._render_live_preview(raw_frame, raw_ts, state, current_stream_fps)
+                # Feed smooth 20+ FPS pre-event buffer & active 8s clip recorder
+                with self._clip_buf_lock:
+                    self._pre_event_buffer.append((raw_ts, preview.copy()))
+                self._prune_pre_event_buffer()
+                if self._clip_lock:
+                    self._feed_clip_recorder(preview, frame_mono=raw_ts)
+
+                ok, jpeg_buf = cv2.imencode(
+                    ".jpg", preview, [int(cv2.IMWRITE_JPEG_QUALITY), jpeg_quality]
+                )
+                if not ok:
+                    continue
+                jpeg_bytes = jpeg_buf.tobytes()
+            except Exception as e:
+                logger.debug(f"[LiveStream] Preview encode error: {e}")
+                continue
+
+            # Zero-blocking handoff to WS sender thread (overwrites any unsent older frame)
+            with self._ws_send_lock:
+                self._ws_pending_jpeg = jpeg_bytes
+                self._ws_send_event.set()
+
+            now_mono = time.monotonic()
+            ws_ok = self._ws_connected
+
+            # Throttled disk write: every 1.0s when WS active, or non-blocking fallback when WS offline
+            if not self._live_frame_writing and (not ws_ok or (now_mono - last_disk_write) >= 1.0):
+                self._live_frame_writing = True
+                last_disk_write = now_mono
+                self._io_executor.submit(self._write_live_frame_async, jpeg_bytes, camera_id)
+
+            win_frames += 1
+            win_bytes += len(jpeg_bytes)
+            win_elapsed = now_mono - win_start
+            if win_elapsed >= 5.0:
+                current_stream_fps = win_frames / win_elapsed
+                avg_kb = (win_bytes / win_frames) / 1024.0
+                logger.info(
+                    f"[LiveStream] Output: {current_stream_fps:.1f} FPS | "
+                    f"Avg JPEG: {avg_kb:.1f} KB | "
+                    f"Transport: {'WS-RAM' if ws_ok else 'Disk-Fallback'}"
+                )
+                win_frames = 0
+                win_bytes = 0
+                win_start = now_mono
+
+            sleep_for = interval - (time.monotonic() - loop_start)
+            if sleep_for > 0.001:
+                time.sleep(sleep_for)
+
+        self._ws_send_event.set()
+        logger.info("[LiveStream] Dedicated stream thread stopped")
+
     def run(self, show_display: bool = True, max_frames: int = 0):
         """
         Run the full edge inference pipeline.
@@ -933,9 +1420,14 @@ class EdgePipeline:
                     self.sync_agent.sync_batch_sync(self.local_store)
                 except Exception:
                     pass
-        import threading
         t_sync = threading.Thread(target=_bg_sync, daemon=True)
         t_sync.start()
+
+        # Start dedicated 25 FPS live stream renderer thread (decoupled from AI inference)
+        self._live_stream_thread = threading.Thread(
+            target=self._live_stream_loop, daemon=True, name="ibvap_live_stream"
+        )
+        self._live_stream_thread.start()
 
         # Determine active execution device string
         active_device = self.config.get_device_description()
@@ -943,7 +1435,7 @@ class EdgePipeline:
         logger.info("=" * 65)
         logger.info("IBVAP Edge Pipeline — Running (Hybrid CPU + GPU Architecture)")
         logger.info(f"  Active Execution Device: {active_device}")
-        logger.info(f"  Inference Engine: YOLO26n ({self.config.yolo_model})")
+        logger.info(f"  Inference Engine: YOLO26 ({self.config.get_yolo_model_path()})")
         logger.info(f"  GPU Vision Workloads: YOLO26 Detection ({'FP16' if self.config.is_half_precision() else 'FP32'}), Gated Face/ANPR ROIs")
         logger.info(f"  CPU Workloads: Video Grabber, ByteTrack, Virtual Fence, Random Forest Activity (n_jobs=1), Async I/O")
         logger.info(f"  Camera Source: {self.config.get_camera_source()}")
@@ -960,6 +1452,7 @@ class EdgePipeline:
                     break
 
                 frame_start = time.time()
+                frame_capture_mono = time.monotonic()
                 frame = packet.frame
                 self._frame_count += 1
 
@@ -1069,23 +1562,8 @@ class EdgePipeline:
                     frame, tracks, cached_zones, all_breaches
                 )
 
-                # ── Pre-Event Ring Buffer (continuous, every frame, pruned to 4.0s) ──
-                self._pre_event_buffer.append((time.monotonic(), overlay.copy()))
-                self._prune_pre_event_buffer()
-
-                # ── Feed Active Clip Recorder (if capture in progress) ──
-                if self._clip_lock:
-                    self._feed_clip_recorder(overlay)
-
-                # Save live frame for real-time frontend streaming (non-blocking CPU worker thread)
-                if not self._live_frame_writing:
-                    try:
-                        ret, jpeg_buf = cv2.imencode(".jpg", overlay, [cv2.IMWRITE_JPEG_QUALITY, 65])
-                        if ret:
-                            self._live_frame_writing = True
-                            self._io_executor.submit(self._write_live_frame_async, jpeg_buf, packet.camera_id)
-                    except Exception:
-                        pass
+                # Publish lightweight overlay cache immediately for decoupled 20 FPS live stream + smooth clip buffer
+                self._update_stream_overlay_state(tracks, cached_zones, all_breaches, capture_mono=frame_capture_mono)
 
                 # ══════════════════════════════════════════════════════════
                 # ALERT STATE MACHINE (10s Zone Cooldown + Occupancy Re-Trigger)
@@ -1213,6 +1691,16 @@ class EdgePipeline:
                 self._stats["avg_fps"] = self._frame_count / elapsed if elapsed > 0 else 0
                 self._stats["avg_latency_ms"] = frame_latency
 
+                # Refresh stream HUD metadata (cooldowns, clip_lock, stats) atomically after alert state update
+                with self._stream_state_lock:
+                    self._stream_overlay_state = {
+                        **self._stream_overlay_state,
+                        "avg_fps": float(self._stats["avg_fps"]),
+                        "tracks_active": int(self._stats["tracks_active"]),
+                        "clip_lock": bool(self._clip_lock),
+                        "zone_cooldown_until": dict(self._zone_cooldown_until),
+                    }
+
                 # --- Display ---
                 if show_display:
                     try:
@@ -1259,6 +1747,11 @@ class EdgePipeline:
                 logger.warning(f"Error finalizing in-flight clip during shutdown: {e}")
 
         self.camera.release()
+        if getattr(self, "_live_stream_thread", None) is not None and self._live_stream_thread.is_alive():
+            try:
+                self._live_stream_thread.join(timeout=1.5)
+            except Exception:
+                pass
         if hasattr(self, "_io_executor"):
             try:
                 self._io_executor.shutdown(wait=True, cancel_futures=False)
@@ -1300,17 +1793,17 @@ def main():
     parser = argparse.ArgumentParser(description="IBVAP Edge Inference Pipeline")
     parser.add_argument("--source", type=str, default=None, help="Video source (file, RTSP URL, or webcam index)")
     parser.add_argument("--gui", action="store_true", default=False, help="Open local desktop OpenCV window (default: False, web view only)")
-    parser.add_argument("--fps", type=int, default=15, help="Target FPS")
-    parser.add_argument("--confidence", type=float, default=0.6, help="Detection confidence threshold")
+    parser.add_argument("--fps", type=int, default=None, help="Target FPS (defaults to CAMERA_FPS in .env)")
+    parser.add_argument("--confidence", type=float, default=None, help="Detection confidence threshold (defaults to DETECTION_CONFIDENCE in .env)")
     parser.add_argument("--max-frames", type=int, default=0, help="Stop after N frames (0=unlimited)")
     args = parser.parse_args()
 
     config = EdgeConfig()
-    if args.source:
+    if args.source is not None:
         config.camera_source = args.source
-    if args.fps:
+    if args.fps is not None:
         config.camera_fps = args.fps
-    if args.confidence:
+    if args.confidence is not None:
         config.detection_confidence = args.confidence
 
     pipeline = EdgePipeline(config=config)

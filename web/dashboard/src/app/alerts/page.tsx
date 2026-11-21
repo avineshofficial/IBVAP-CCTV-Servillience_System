@@ -24,8 +24,8 @@ export default function AlertsPage() {
     setVideoBuffering(false);
   };
 
-  const loadAlerts = useCallback(async () => {
-    setLoading(true);
+  const loadAlerts = useCallback(async (showSpinner = false) => {
+    if (showSpinner) setLoading(true);
     try {
       const params: Record<string, string> = { limit: "100" };
       if (filter.status) params.status = filter.status;
@@ -35,7 +35,7 @@ export default function AlertsPage() {
     } catch {
       setAlerts([]);
     } finally {
-      setLoading(false);
+      if (showSpinner) setLoading(false);
     }
   }, [filter.status, filter.severity]);
 
@@ -152,7 +152,7 @@ export default function AlertsPage() {
             🗑 Clear Alert Queue
           </button>
           <button
-            onClick={loadAlerts}
+            onClick={() => loadAlerts(true)}
             className="btn-tactical-outline text-[11px] font-mono uppercase tracking-wider py-1 px-2.5"
           >
             ↻ Refresh Incidents
@@ -387,12 +387,12 @@ export default function AlertsPage() {
                     playsInline
                     muted
                     preload="auto"
-                    className={`w-full h-full object-contain ${videoBuffering ? "hidden" : "block"}`}
+                    className="w-full h-full object-contain block"
                     onLoadedData={() => setVideoBuffering(false)}
-                    onWaiting={() => setVideoBuffering(true)}
+                    onCanPlay={() => setVideoBuffering(false)}
                     onPlaying={() => setVideoBuffering(false)}
                     onError={() => {
-                      if (videoRetryKey < 3) {
+                      if (videoRetryKey < 6) {
                         setVideoBuffering(true);
                         setTimeout(() => setVideoRetryKey((k) => k + 1), 1500);
                       } else {
@@ -404,11 +404,11 @@ export default function AlertsPage() {
                     Your browser does not support HTML5 video playback.
                   </video>
                   {videoBuffering && (
-                    <div className="text-center p-8 text-cyan-400 font-mono text-xs">
+                    <div className="absolute inset-0 bg-[#040711]/85 flex flex-col items-center justify-center text-center p-8 text-cyan-400 font-mono text-xs pointer-events-none">
                       <div className="inline-block animate-spin text-2xl mb-2 text-cyan-400">⟳</div>
                       <p className="font-bold text-xs tracking-wider text-white">CAPTURING POST-INCIDENT FOOTAGE...</p>
                       <p className="text-slate-400 text-[11px] mt-1">
-                        Finalizing 7-8s tactical evidence clip (~3.5s before + ~4.0s after touch).
+                        Finalizing 8s tactical evidence clip (~4.0s before + ~4.0s after breach).
                       </p>
                       <p className="text-[10px] text-cyan-400 mt-2 font-semibold font-mono-tabular">
                         Auto-playing shortly (attempt {videoRetryKey + 1}/7)...

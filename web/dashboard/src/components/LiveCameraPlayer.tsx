@@ -1,6 +1,6 @@
 "use client";
 import React, { useEffect, useState, useRef, useSyncExternalStore } from "react";
-import { getCameraStreamUrl, getCameraFrameUrl, getMediaUrl } from "@/lib/api";
+import { getCameraStreamUrl } from "@/lib/api";
 
 interface LiveCameraPlayerProps {
   cameraUid: string;
@@ -17,93 +17,198 @@ function LiveCameraPlayerInternal({
 }: LiveCameraPlayerProps) {
   const isClient = useSyncExternalStore(emptySubscribe, () => true, () => false);
   const [isReceiving, setIsReceiving] = useState<boolean>(false);
-  const [retryCount, setRetryCount] = useState<number>(0);
-  const [useFallback, setUseFallback] = useState<boolean>(false);
-  const [fallbackUrl, setFallbackUrl] = useState<string | null>(null);
+  const [useMjpegFallback, setUseMjpegFallback] = useState<boolean>(false);
+  const [mjpegRetry, setMjpegRetry] = useState<number>(0);
 
-  const errorCountRef = useRef<number>(0);
-  const reconnectTimerRef = useRef<NodeJS.Timeout | null>(null);
-  const fallbackTimerRef = useRef<NodeJS.Timeout | null>(null);
-  const activeFallbackBlobRef = useRef<string | null>(null);
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const ctxRef = useRef<CanvasRenderingContext2D | null>(null);
+  const imgRef = useRef<HTMLImageElement | null>(null);
+  const fpsBadgeRef = useRef<HTMLSpanElement | null>(null);
 
-  const streamUrl = retryCount > 0
-    ? `${getCameraStreamUrl(cameraUid)}?_r=${retryCount}`
-    : getCameraStreamUrl(cameraUid);
+  // Refs for zero-rerender, zero-queue-buildup frame rendering
+  const wsRef = useRef<WebSocket | null>(null);
+  const rafIdRef = useRef<number>(0);
+  const isDecodingRef = useRef<boolean>(false);
+  const pendingBitmapRef = useRef<ImageBitmap | null>(null);
+  const hasReceivedFrameRef = useRef<boolean>(false);
+  const wsFailCountRef = useRef<number>(0);
+  const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const frameCounterRef = useRef<number>(0);
+  const lastFpsTimeRef = useRef<number>(0);
 
-  // Fallback Polling Loop (only triggered if native multipart streaming is blocked)
+  const streamUrl = getCameraStreamUrl(cameraUid);
+  const wsUrl = streamUrl.replace(/^http/, "ws").replace(/\/stream$/, "/ws");
+  const activeMjpegUrl = mjpegRetry > 0 ? `${streamUrl}?_r=${mjpegRetry}` : streamUrl;
+
+  // Primary: Binary WebSocket -> createImageBitmap -> requestAnimationFrame -> <canvas>
+  // Zero React state updates per frame; closes old bitmaps immediately to keep memory flat.
   useEffect(() => {
-    if (!useFallback) {
-      if (fallbackTimerRef.current) clearTimeout(fallbackTimerRef.current);
-      if (activeFallbackBlobRef.current) {
-        URL.revokeObjectURL(activeFallbackBlobRef.current);
-        activeFallbackBlobRef.current = null;
-      }
-      return;
-    }
+    if (!isClient || useMjpegFallback) return;
 
     let isMounted = true;
-    const fetchFallbackFrame = async () => {
+    hasReceivedFrameRef.current = false;
+    frameCounterRef.current = 0;
+    lastFpsTimeRef.current = performance.now();
+
+    const drawLoop = () => {
       if (!isMounted) return;
-      const t = Date.now();
-      try {
-        let res = await fetch(`${getCameraFrameUrl(cameraUid)}?_t=${t}`, { cache: "no-store" });
-        if (!res.ok) {
-          res = await fetch(`${getMediaUrl(`/media/live_${cameraUid}.jpg`)}?_t=${t}`, { cache: "no-store" });
+
+      const bitmap = pendingBitmapRef.current;
+      const canvas = canvasRef.current;
+
+      if (bitmap && canvas) {
+        pendingBitmapRef.current = null;
+        if (!ctxRef.current) {
+          ctxRef.current = canvas.getContext("2d", { alpha: false });
         }
-        if (res.ok) {
-          const blob = await res.blob();
-          if (isMounted && blob.size > 200) {
-            const nextUrl = URL.createObjectURL(blob);
-            setFallbackUrl(nextUrl);
-            setIsReceiving(true);
-            if (activeFallbackBlobRef.current) {
-              URL.revokeObjectURL(activeFallbackBlobRef.current);
-            }
-            activeFallbackBlobRef.current = nextUrl;
+        const ctx = ctxRef.current;
+        if (ctx) {
+          if (canvas.width !== bitmap.width || canvas.height !== bitmap.height) {
+            canvas.width = bitmap.width;
+            canvas.height = bitmap.height;
+          }
+          ctx.drawImage(bitmap, 0, 0);
+        }
+        bitmap.close();
+
+        if (!hasReceivedFrameRef.current) {
+          hasReceivedFrameRef.current = true;
+          setIsReceiving(true);
+        }
+
+        frameCounterRef.current += 1;
+        const now = performance.now();
+        const elapsed = now - lastFpsTimeRef.current;
+        if (elapsed >= 1000) {
+          const fps = Math.round((frameCounterRef.current * 1000) / elapsed);
+          frameCounterRef.current = 0;
+          lastFpsTimeRef.current = now;
+          if (fpsBadgeRef.current) {
+            fpsBadgeRef.current.textContent = `STREAM: LIVE (${fps} FPS)`;
           }
         }
+      }
+
+      rafIdRef.current = requestAnimationFrame(drawLoop);
+    };
+
+    const connectWs = () => {
+      if (!isMounted) return;
+      try {
+        const ws = new WebSocket(wsUrl);
+        ws.binaryType = "arraybuffer";
+        wsRef.current = ws;
+
+        ws.onopen = () => {
+          if (!isMounted) {
+            ws.close();
+            return;
+          }
+          wsFailCountRef.current = 0;
+        };
+
+        ws.onmessage = (event: MessageEvent) => {
+          if (!isMounted) return;
+          const data = event.data;
+          if (!(data instanceof ArrayBuffer) || data.byteLength < 100) return;
+
+          // Drop incoming frame if previous decode is still running (prevents latency buildup)
+          if (isDecodingRef.current) return;
+          isDecodingRef.current = true;
+
+          const blob = new Blob([data], { type: "image/jpeg" });
+          createImageBitmap(blob)
+            .then((bitmap) => {
+              if (!isMounted) {
+                bitmap.close();
+                return;
+              }
+              const old = pendingBitmapRef.current;
+              pendingBitmapRef.current = bitmap;
+              if (old) old.close();
+            })
+            .catch(() => {
+              /* ignore corrupted frame */
+            })
+            .finally(() => {
+              isDecodingRef.current = false;
+            });
+        };
+
+        ws.onerror = () => {
+          /* handled in onclose */
+        };
+
+        ws.onclose = () => {
+          if (!isMounted) return;
+          wsRef.current = null;
+          wsFailCountRef.current += 1;
+          if (wsFailCountRef.current >= 3) {
+            setUseMjpegFallback(true);
+            return;
+          }
+          reconnectTimerRef.current = setTimeout(connectWs, 1200);
+        };
       } catch {
-        /* fallback retry */
-      } finally {
-        if (isMounted && useFallback) {
-          fallbackTimerRef.current = setTimeout(fetchFallbackFrame, 40);
+        wsFailCountRef.current += 1;
+        if (wsFailCountRef.current >= 3) {
+          setUseMjpegFallback(true);
+        } else {
+          reconnectTimerRef.current = setTimeout(connectWs, 1200);
         }
       }
     };
 
-    fetchFallbackFrame();
+    rafIdRef.current = requestAnimationFrame(drawLoop);
+    connectWs();
 
     return () => {
       isMounted = false;
-      if (fallbackTimerRef.current) clearTimeout(fallbackTimerRef.current);
-      if (activeFallbackBlobRef.current) {
-        URL.revokeObjectURL(activeFallbackBlobRef.current);
-        activeFallbackBlobRef.current = null;
+      cancelAnimationFrame(rafIdRef.current);
+      if (reconnectTimerRef.current) {
+        clearTimeout(reconnectTimerRef.current);
+        reconnectTimerRef.current = null;
+      }
+      if (wsRef.current) {
+        try {
+          wsRef.current.close();
+        } catch {
+          /* ignore */
+        }
+        wsRef.current = null;
+      }
+      if (pendingBitmapRef.current) {
+        pendingBitmapRef.current.close();
+        pendingBitmapRef.current = null;
+      }
+      ctxRef.current = null;
+    };
+  }, [isClient, useMjpegFallback, wsUrl]);
+
+  // Guaranteed teardown for MJPEG fallback <img> so browser immediately closes multipart HTTP stream on unmount
+  useEffect(() => {
+    const imgEl = imgRef.current;
+    return () => {
+      if (reconnectTimerRef.current) {
+        clearTimeout(reconnectTimerRef.current);
+        reconnectTimerRef.current = null;
+      }
+      if (imgEl) {
+        imgEl.src = "";
       }
     };
-  }, [useFallback, cameraUid]);
+  }, [useMjpegFallback, activeMjpegUrl]);
 
-  // Handle stream error & automatic reconnection
-  const handleStreamError = () => {
+  const handleMjpegError = () => {
     setIsReceiving(false);
-    errorCountRef.current += 1;
-
-    // After 3 failed stream connection attempts, activate fallback mode
-    if (errorCountRef.current >= 4) {
-      setUseFallback(true);
-      return;
-    }
-
-    // Otherwise, retry native stream connection after a short backoff
     if (reconnectTimerRef.current) clearTimeout(reconnectTimerRef.current);
     reconnectTimerRef.current = setTimeout(() => {
-      setRetryCount((prev) => prev + 1);
+      setMjpegRetry((prev) => prev + 1);
     }, 1500);
   };
 
-  const handleStreamLoad = () => {
+  const handleMjpegLoad = () => {
     setIsReceiving(true);
-    errorCountRef.current = 0;
   };
 
   return (
@@ -119,30 +224,33 @@ function LiveCameraPlayerInternal({
       {/* Calibrated Center Crosshair */}
       <div className="reticle-crosshair"></div>
 
-      {/* Primary Native Low-Latency MJPEG Stream */}
-      {isClient && !useFallback && (
-        <img
-          key={retryCount}
-          src={streamUrl}
-          alt={`Live Feed from ${cameraName}`}
-          className={`w-full h-full object-contain select-none transition-opacity duration-300 ${
+      {/* Primary: Zero-Stutter Binary WebSocket Canvas Player */}
+      {isClient && !useMjpegFallback && (
+        <canvas
+          ref={canvasRef}
+          aria-label={`Live Feed from ${cameraName}`}
+          className={`w-full h-full object-contain select-none transition-opacity duration-200 ${
             isReceiving ? "opacity-100" : "opacity-0 absolute inset-0 pointer-events-none"
           }`}
-          onLoad={handleStreamLoad}
-          onError={handleStreamError}
         />
       )}
 
-      {/* Fallback Single-Frame Player */}
-      {isClient && useFallback && fallbackUrl && (
+      {/* Fallback: Single Stable Native MJPEG <img> Stream (zero per-frame setState) */}
+      {isClient && useMjpegFallback && (
         <img
-          src={fallbackUrl}
+          ref={imgRef}
+          key={mjpegRetry}
+          src={activeMjpegUrl}
           alt={`Live Feed from ${cameraName}`}
-          className="w-full h-full object-contain select-none"
+          className={`w-full h-full object-contain select-none transition-opacity duration-200 ${
+            isReceiving ? "opacity-100" : "opacity-0 absolute inset-0 pointer-events-none"
+          }`}
+          onLoad={handleMjpegLoad}
+          onError={handleMjpegError}
         />
       )}
 
-      {/* Tactical Waiting HUD (shown when sensor frames are offline) */}
+      {/* Tactical Waiting HUD (shown until first frame arrives) */}
       {!isReceiving && (
         <div className="absolute inset-0 flex flex-col items-center justify-center p-6 text-center space-y-2.5 bg-[#040711]/90">
           <div className="relative flex items-center justify-center w-12 h-12 rounded-[4px] border border-cyan-500/30 bg-cyan-950/20">
@@ -181,12 +289,14 @@ function LiveCameraPlayerInternal({
         </div>
       </div>
 
-      {/* Telemetry Badge (Bottom Right) */}
+      {/* Telemetry Badge (Bottom Right) — updated via ref at 1 Hz (zero React re-renders per frame) */}
       <div className="absolute bottom-2.5 right-2.5 z-20">
         <div className="bg-[#050811]/90 backdrop-blur-md px-2 py-1 rounded-[3px] border border-[#162035] text-[10px] font-mono text-cyan-300 font-bold font-mono-tabular">
-          {isReceiving
-            ? `STREAM: ${useFallback ? "FALLBACK (20 FPS)" : "FLUENT (25-30 FPS)"}`
-            : `CHANNEL: ${cameraUid.toUpperCase()}`}
+          <span ref={fpsBadgeRef}>
+            {isReceiving
+              ? `STREAM: ${useMjpegFallback ? "MJPEG (25 FPS)" : "LIVE (25 FPS)"}`
+              : `CHANNEL: ${cameraUid.toUpperCase()}`}
+          </span>
         </div>
       </div>
     </div>

@@ -45,18 +45,18 @@ class EdgeConfig:
     frame_height: int = int(os.getenv("FRAME_HEIGHT", "720"))
 
     # --- Detection (YOLO26 with RTX 3050 CUDA Acceleration) ---
-    yolo_model: str = os.getenv("YOLO_MODEL", "yolo26n.pt")
+    yolo_model: str = os.getenv("YOLO_MODEL", "yolo26s.pt")
     yolo_device: str = os.getenv("YOLO_DEVICE", "cuda:0")
-    yolo_half_precision: bool = os.getenv("YOLO_HALF_PRECISION", "true").lower() == "true"
+    yolo_half_precision: bool = os.getenv("YOLO_HALF_PRECISION", "false").lower() == "true"
     yolo_imgsz: int = int(os.getenv("YOLO_IMGSZ", "640"))
-    detection_confidence: float = float(os.getenv("DETECTION_CONFIDENCE", "0.6"))
+    detection_confidence: float = float(os.getenv("DETECTION_CONFIDENCE", "0.45"))
     detection_classes: list = field(default_factory=lambda: [0, 1, 2, 3, 5, 7])
     # COCO classes: 0=person, 1=bicycle, 2=car, 3=motorcycle, 5=bus, 7=truck
 
     # --- Tracking & Inference Stride ---
     tracker_type: str = os.getenv("TRACKER_TYPE", "bytetrack.yaml")
     track_buffer: int = int(os.getenv("TRACK_BUFFER", "30"))
-    inference_stride: int = int(os.getenv("INFERENCE_STRIDE", "0"))  # 0 = auto (1 on CUDA GPU, 2 on CPU)
+    inference_stride: int = int(os.getenv("INFERENCE_STRIDE", "1"))  # 1 = every frame for reliable ByteTrack IoU matching
 
     # --- Night Enhancement ---
     night_enhance_enabled: bool = os.getenv("NIGHT_ENHANCE_ENABLED", "false").lower() == "true"
@@ -91,18 +91,18 @@ class EdgeConfig:
     telegram_chat_id: str = os.getenv("TELEGRAM_CHAT_ID", "")
 
     # --- Perspective Restricted Zone (calibrated to floor perspective) ---
-    # Calibrated to the floor perimeter matching the camera view:
-    #   - Top boundary perimeter: (0, 505) -> (1280, 505)
-    #   - Bottom floor coverage: (1280, 720) -> (0, 720)
+    # Calibrated to the floor perimeter matching the user-marked camera view:
+    #   - Top boundary perimeter: (9, 517) -> (1272, 517)
+    #   - Bottom floor coverage: (1272, 717) -> (9, 717)
     # Can also be customized in .env via RESTRICTED_ZONE_POLYGON
     restricted_zone_polygon: list = field(default_factory=lambda: (
         [tuple(p) for p in json.loads(os.getenv("RESTRICTED_ZONE_POLYGON"))]
         if os.getenv("RESTRICTED_ZONE_POLYGON")
         else [
-            (0, 505),       # Far-left border point (aligned to blue perimeter)
-            (1280, 505),    # Far-right border point (aligned to blue perimeter)
-            (1280, 720),    # Bottom-right corner
-            (0, 720),       # Bottom-left corner
+            (9, 517),       # Top-left border point
+            (1272, 517),    # Top-right border point
+            (1272, 717),    # Bottom-right corner
+            (9, 717),       # Bottom-left corner
         ]
     ))
 
@@ -192,11 +192,22 @@ class EdgeConfig:
         return "CPU: Intel Core i5-13420H"
 
     def get_yolo_model_path(self) -> str:
-        """Resolve the model path, checking ml/models/ and root for yolo26n.pt."""
+        """Resolve local YOLO weights (ml/models/ or project root), with offline fallback to yolo26s.pt."""
         p = Path(self.yolo_model)
         if p.exists():
             return str(p)
-        in_models = self.models_dir / self.yolo_model
+        in_models = self.models_dir / p.name
         if in_models.exists():
             return str(in_models)
+        in_root = PROJECT_ROOT / p.name
+        if in_root.exists():
+            return str(in_root)
+        # Offline-safe fallback: use existing local yolo26s.pt or any local yolo26*.pt model
+        preferred = self.models_dir / "yolo26s.pt"
+        if preferred.exists():
+            return str(preferred)
+        if self.models_dir.exists():
+            candidates = sorted(self.models_dir.glob("yolo26*.pt"))
+            if candidates:
+                return str(candidates[0])
         return self.yolo_model

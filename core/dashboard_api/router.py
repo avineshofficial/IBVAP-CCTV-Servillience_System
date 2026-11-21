@@ -11,7 +11,7 @@ from datetime import datetime
 from typing import Optional
 import cv2
 import numpy as np
-from fastapi import APIRouter, Depends, HTTPException, Query, Response
+from fastapi import APIRouter, Depends, HTTPException, Query, Response, WebSocket, WebSocketDisconnect
 from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, update, and_, delete
@@ -34,8 +34,70 @@ router = APIRouter(prefix="/api/v1", tags=["Dashboard"])
 
 _start_time = time.time()
 
+
+class _CameraStreamSlot:
+    """Race-free async pub/sub slot for pre-encoded live JPEG frames."""
+
+    def __init__(self):
+        self.jpeg: Optional[bytes] = None
+        self.seq: int = 0
+        self.updated_at: float = 0.0
+        self._next_event: asyncio.Event = asyncio.Event()
+
+    def publish(self, jpeg_bytes: bytes) -> None:
+        self.jpeg = jpeg_bytes
+        self.seq += 1
+        self.updated_at = time.time()
+        # Wake all waiting clients atomically without clear() race conditions
+        ev = self._next_event
+        self._next_event = asyncio.Event()
+        ev.set()
+
+    async def wait_for_next(self, last_seq: int, timeout: float = 0.5) -> tuple[int, Optional[bytes]]:
+        if self.seq > last_seq and self.jpeg is not None:
+            return self.seq, self.jpeg
+        ev = self._next_event
+        try:
+            await asyncio.wait_for(ev.wait(), timeout=timeout)
+        except asyncio.TimeoutError:
+            return last_seq, None
+        return self.seq, self.jpeg
+
+
+class _LiveFrameHub:
+    """In-memory relay for pre-encoded live camera JPEG frames (zero re-encoding per client)."""
+
+    def __init__(self):
+        self._slots: dict[str, _CameraStreamSlot] = {}
+
+    def get_slot(self, camera_uid: str) -> _CameraStreamSlot:
+        slot = self._slots.get(camera_uid)
+        if slot is None:
+            slot = _CameraStreamSlot()
+            self._slots[camera_uid] = slot
+        return slot
+
+    def publish(self, camera_uid: str, jpeg_bytes: bytes) -> None:
+        self.get_slot(camera_uid).publish(jpeg_bytes)
+
+    def get_latest(self, camera_uid: str, max_age: float = 5.0) -> Optional[bytes]:
+        slot = self._slots.get(camera_uid)
+        if slot and slot.jpeg is not None and (time.time() - slot.updated_at) <= max_age:
+            return slot.jpeg
+        return None
+
+    def is_fresh(self, camera_uid: str, max_age: float = 15.0) -> bool:
+        slot = self._slots.get(camera_uid)
+        return bool(slot and slot.jpeg is not None and (time.time() - slot.updated_at) <= max_age)
+
+
+_live_frame_hub = _LiveFrameHub()
+
+
 def is_camera_live(camera_uid: str) -> bool:
-    """Check if the camera's live edge frame is fresh (< 12 seconds)."""
+    """Check if the camera's live edge frame is fresh (RAM hub first, disk fallback)."""
+    if _live_frame_hub.is_fresh(camera_uid, max_age=15.0):
+        return True
     live_file = CoreConfig.MEDIA_DIR / f"live_{camera_uid}.jpg"
     if live_file.exists():
         try:
@@ -132,53 +194,156 @@ async def create_camera(camera: CameraCreate, user = Depends(require_role("admin
     return db_camera
 
 
+@router.websocket("/cameras/{camera_uid}/ingest")
+async def ingest_camera_stream(websocket: WebSocket, camera_uid: str):
+    """Binary WebSocket ingest from Edge live-stream thread -> Core RAM hub.
+
+    Zero HTTP overhead, zero per-frame access log spam, zero disk I/O contention.
+    """
+    edge_key = websocket.headers.get("x-edge-api-key") or websocket.query_params.get("key")
+    if CoreConfig.EDGE_API_KEY and edge_key and edge_key != CoreConfig.EDGE_API_KEY:
+        await websocket.close(code=1008)
+        return
+
+    await websocket.accept()
+    logger.info(f"[LiveStream] Edge ingest connected for {camera_uid}")
+    try:
+        while True:
+            data = await websocket.receive_bytes()
+            if data and len(data) > 100:
+                _live_frame_hub.publish(camera_uid, data)
+    except (WebSocketDisconnect, asyncio.CancelledError):
+        pass
+    except Exception as e:
+        logger.debug(f"[LiveStream] Edge ingest closed for {camera_uid}: {e}")
+    finally:
+        logger.info(f"[LiveStream] Edge ingest disconnected for {camera_uid}")
+
+
+@router.websocket("/cameras/{camera_uid}/ws")
+async def stream_camera_ws(websocket: WebSocket, camera_uid: str):
+    """Non-blocking binary WebSocket live stream for zero-stutter <canvas> rendering.
+
+    Fans out pre-encoded JPEG bytes using asyncio.Event + frame sequence counter
+    (never re-encodes, never sends duplicate frames, drops slow frames).
+    """
+    await websocket.accept()
+    slot = _live_frame_hub.get_slot(camera_uid)
+    target = CoreConfig.MEDIA_DIR / f"live_{camera_uid}.jpg"
+    last_seq = 0
+    last_mtime = 0.0
+
+    try:
+        # Send immediate initial frame if already buffered in RAM
+        if slot.jpeg is not None and (time.time() - slot.updated_at) <= 5.0:
+            last_seq = slot.seq
+            await asyncio.wait_for(websocket.send_bytes(slot.jpeg), timeout=0.25)
+
+        while True:
+            # Fast 30ms timeout during disk fallback so we never cap at 1-2 FPS if WS ingest is down
+            hub_fresh = _live_frame_hub.is_fresh(camera_uid, max_age=2.0)
+            new_seq, frame_bytes = await slot.wait_for_next(last_seq, timeout=0.5 if hub_fresh else 0.03)
+            if frame_bytes is not None and new_seq != last_seq:
+                last_seq = new_seq
+                try:
+                    await asyncio.wait_for(websocket.send_bytes(frame_bytes), timeout=0.25)
+                except asyncio.TimeoutError:
+                    # Drop frame if client socket is temporarily congested
+                    continue
+                continue
+
+            # Disk fallback ONLY if edge WS ingest is not currently pushing
+            if not hub_fresh and target.exists():
+                try:
+                    stat = target.stat()
+                    if stat.st_mtime != last_mtime:
+                        last_mtime = stat.st_mtime
+                        with open(target, "rb") as f:
+                            data = f.read()
+                        if data and len(data) > 100:
+                            await asyncio.wait_for(websocket.send_bytes(data), timeout=0.25)
+                            continue
+                except asyncio.TimeoutError:
+                    continue
+                except Exception:
+                    pass
+    except (WebSocketDisconnect, asyncio.CancelledError):
+        pass
+    except Exception:
+        pass
+
+
 @router.get("/cameras/{camera_uid}/frame")
 async def get_camera_frame(camera_uid: str):
     """
     Get the newest live frame from the camera as a single JPEG image.
-    Ultra-reliable, zero-drop browser rendering without multipart/x-mixed-replace bugs.
+    Serves from Core RAM hub first for sub-millisecond response, falling back to disk.
     """
-    target = CoreConfig.MEDIA_DIR / f"live_{camera_uid}.jpg"
-    if not target.exists():
-        raise HTTPException(status_code=404, detail="No live frame available")
+    data = _live_frame_hub.get_latest(camera_uid, max_age=5.0)
+    if data is None:
+        target = CoreConfig.MEDIA_DIR / f"live_{camera_uid}.jpg"
+        if not target.exists():
+            raise HTTPException(status_code=404, detail="No live frame available")
+        try:
+            with open(target, "rb") as f:
+                data = f.read()
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
 
-    try:
-        with open(target, "rb") as f:
-            data = f.read()
+    if not data or len(data) < 100:
+        raise HTTPException(status_code=404, detail="Frame data empty")
 
-        if not data or len(data) < 100:
-            raise HTTPException(status_code=404, detail="Frame data empty")
-
-        return Response(
-            content=data,
-            media_type="image/jpeg",
-            headers={
-                "Cache-Control": "no-cache, no-store, must-revalidate",
-                "Pragma": "no-cache",
-                "Expires": "0",
-                "Access-Control-Allow-Origin": "*",
-            },
-        )
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    return Response(
+        content=data,
+        media_type="image/jpeg",
+        headers={
+            "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+            "Pragma": "no-cache",
+            "Expires": "0",
+            "Access-Control-Allow-Origin": "*",
+        },
+    )
 
 
 @router.get("/cameras/{camera_uid}/stream")
 async def stream_camera(camera_uid: str):
     """
-    Live low-latency MJPEG video stream for a camera.
-    Returns real-time annotated edge frames with bounding boxes and virtual fence overlays.
+    Non-blocking async MJPEG video stream for a camera.
+    Yields pre-encoded JPEG bytes using an asyncio.Event + sequence counter
+    (zero re-encoding, zero duplicate frames, zero proxy buffering).
     """
     async def frame_generator():
+        slot = _live_frame_hub.get_slot(camera_uid)
         target = CoreConfig.MEDIA_DIR / f"live_{camera_uid}.jpg"
+        last_seq = 0
         last_mtime = 0.0
-        cached_frame = None
 
         try:
+            # Yield immediate cached frame on connect if fresh
+            if slot.jpeg is not None and (time.time() - slot.updated_at) <= 5.0:
+                last_seq = slot.seq
+                yield (
+                    b"--frame\r\n"
+                    b"Content-Type: image/jpeg\r\n"
+                    b"Content-Length: " + str(len(slot.jpeg)).encode() + b"\r\n\r\n" +
+                    slot.jpeg + b"\r\n"
+                )
+
             while True:
-                if target.exists():
+                hub_fresh = _live_frame_hub.is_fresh(camera_uid, max_age=2.0)
+                new_seq, frame_bytes = await slot.wait_for_next(last_seq, timeout=0.5 if hub_fresh else 0.03)
+                if frame_bytes is not None and new_seq != last_seq:
+                    last_seq = new_seq
+                    yield (
+                        b"--frame\r\n"
+                        b"Content-Type: image/jpeg\r\n"
+                        b"Content-Length: " + str(len(frame_bytes)).encode() + b"\r\n\r\n" +
+                        frame_bytes + b"\r\n"
+                    )
+                    continue
+
+                # Disk fallback ONLY if edge WS ingest is not currently pushing
+                if not hub_fresh and target.exists():
                     try:
                         stat = target.stat()
                         if stat.st_mtime != last_mtime:
@@ -186,20 +351,15 @@ async def stream_camera(camera_uid: str):
                             with open(target, "rb") as f:
                                 data = f.read()
                             if data and len(data) > 100:
-                                cached_frame = data
+                                yield (
+                                    b"--frame\r\n"
+                                    b"Content-Type: image/jpeg\r\n"
+                                    b"Content-Length: " + str(len(data)).encode() + b"\r\n\r\n" +
+                                    data + b"\r\n"
+                                )
+                                continue
                     except Exception:
                         pass
-
-                if cached_frame is not None:
-                    yield (
-                        b"--frame\r\n"
-                        b"Content-Type: image/jpeg\r\n"
-                        b"Content-Length: " + str(len(cached_frame)).encode() + b"\r\n\r\n" +
-                        cached_frame + b"\r\n"
-                    )
-                    await asyncio.sleep(0.033)  # Smooth 30 FPS delivery
-                else:
-                    await asyncio.sleep(0.1)
         except (asyncio.CancelledError, GeneratorExit):
             pass
 
@@ -207,9 +367,10 @@ async def stream_camera(camera_uid: str):
         frame_generator(),
         media_type="multipart/x-mixed-replace; boundary=frame",
         headers={
-            "Cache-Control": "no-cache, no-store, must-revalidate",
+            "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
             "Pragma": "no-cache",
             "Expires": "0",
+            "X-Accel-Buffering": "no",
             "Access-Control-Allow-Origin": "*",
             "Connection": "keep-alive",
         },
@@ -423,7 +584,7 @@ async def create_zone(
         existing_zone.rule_type = zone.rule_type
         existing_zone.dwell_threshold = zone.dwell_threshold
         existing_zone.direction_vector = zone.direction_vector
-        existing_zone.is_active = zone.is_active
+        existing_zone.is_active = getattr(zone, "is_active", True)
         await db.commit()
         await db.refresh(existing_zone)
         return existing_zone

@@ -58,7 +58,7 @@ class Tracker:
 
     def __init__(
         self,
-        model_name: str = "yolo26n.pt",
+        model_name: str = "yolo26s.pt",
         tracker_config: str = "bytetrack.yaml",
         confidence_threshold: float = 0.4,
         target_classes: list[int] = None,
@@ -148,6 +148,17 @@ class Tracker:
             except Exception as e:
                 logger.warning(f"Could not bind tracking model to {self._device}: {e}")
 
+            # Warm up CUDA kernels once during startup so Frame #1 runs at full 25+ FPS with zero stall
+            if self._device.startswith("cuda"):
+                try:
+                    dummy = np.zeros((384, 640, 3), dtype=np.uint8)
+                    warm_kw = {"device": self._device, "imgsz": self.imgsz, "verbose": False}
+                    if self._half:
+                        warm_kw["quantize"] = "fp16"
+                    self._model.predict(dummy, **warm_kw)
+                except Exception:
+                    pass
+
             self._initialized = True
             self._simulation_mode = False
             logger.info("Tracker initialized successfully (YOLO26 mode)")
@@ -217,8 +228,8 @@ class Tracker:
                 "verbose": False,
                 "imgsz": self.imgsz,
             }
-            if self._device.startswith("cuda"):
-                track_kwargs["half"] = self._half
+            if self._device.startswith("cuda") and self._half:
+                track_kwargs["quantize"] = "fp16"
 
             results = self._model.track(frame, **track_kwargs)
 
